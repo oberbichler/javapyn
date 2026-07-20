@@ -1,0 +1,238 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version number to release (e.g., 0.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-release:
+    name: Prepare Release & Git Tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required for pushing commits, creating tags, and creating GitHub releases
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Bump version in configuration files
+        id: bump
+        run: |
+          python -c "
+          import re
+          version = '${{ inputs.version }}'
+
+          # 1. Update pyproject.toml
+          with open('pyproject.toml', 'r') as f:
+              content = f.read()
+          content = re.sub(r'(?<=^version = \")[^\"]+', version, content, count=1, flags=re.MULTILINE)
+          with open('pyproject.toml', 'w') as f:
+              f.write(content)
+
+          # 2. Update Cargo.toml
+          with open('Cargo.toml', 'r') as f:
+              content = f.read()
+          content = re.sub(r'(?<=^version = \")[^\"]+', version, content, count=1, flags=re.MULTILINE)
+          with open('Cargo.toml', 'w') as f:
+              f.write(content)
+          "
+          echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml Cargo.toml
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "chore: bump version to v${{ inputs.version }}"
+            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git push origin main
+          else
+            echo "No changes to commit (version is already set to ${{ inputs.version }})."
+          fi
+
+      - name: Create and push Git tag
+        run: |
+          if git rev-parse "v${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "Tag v${{ inputs.version }} already exists. Force updating tag."
+            git tag -f "v${{ inputs.version }}"
+            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git push origin "v${{ inputs.version }}" --force
+          else
+            git tag "v${{ inputs.version }}"
+            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git push origin "v${{ inputs.version }}"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ inputs.version }}" --title "v${{ inputs.version }}" --generate-notes || echo "Release already exists."
+
+  linux:
+    runs-on: ${{ matrix.platform.runner }}
+    needs: prepare-release
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: "v${{ needs.prepare-release.outputs.version }}"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          # -i python3.10 picks the manylinux container's bundled floor
+          # interpreter explicitly (see the NOTE below on abi3).
+          args: --release --out dist -i python3.10
+          sccache: 'true'
+          manylinux: auto
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: dist
+
+  musllinux:
+    runs-on: ${{ matrix.platform.runner }}
+    needs: prepare-release
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-22.04
+            target: x86_64
+          - runner: ubuntu-22.04
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: "v${{ needs.prepare-release.outputs.version }}"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist -i python3.10
+          sccache: 'true'
+          manylinux: musllinux_1_2
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-musllinux-${{ matrix.platform.target }}
+          path: dist
+
+  windows:
+    runs-on: windows-latest
+    needs: prepare-release
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: "v${{ needs.prepare-release.outputs.version }}"
+      # Any single interpreter >= the abi3-py310 floor works as the build
+      # tool (it doesn't need to *be* 3.10); "3.x" is simplest.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+          architecture: x64
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist
+          sccache: 'true'
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  macos:
+    runs-on: ${{ matrix.platform.runner }}
+    needs: prepare-release
+    strategy:
+      matrix:
+        platform:
+          - runner: macos-15-intel
+            target: x86_64
+          - runner: macos-latest
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: "v${{ needs.prepare-release.outputs.version }}"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          sccache: 'true'
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-macos-${{ matrix.platform.target }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    needs: prepare-release
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: "v${{ needs.prepare-release.outputs.version }}"
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [linux, musllinux, windows, macos, sdist]
+    permissions:
+      id-token: write # Required for PyPI OIDC Trusted Publishing and artifact signing
+      contents: write # Used to upload release artifacts
+      attestations: write # Used to generate artifact attestation
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: 'wheels-*'
+          path: dist
+          merge-multiple: true
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: 'dist/*'
+      - name: Publish all packages to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

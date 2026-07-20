@@ -1,0 +1,55 @@
+{
+  "responseHeader": {
+    "zkConnected": true,
+    "status": 0,
+    "QTime": 2
+  },
+  "response": {
+    "numFound": 5,
+    "start": 0,
+    "docs": [
+      {
+        "studio_id": "studio-101",
+        "studio_name": "Warner Bros.",
+        "is_active": true,
+        "has_backlot": true,
+        "has_soundstage": false,
+        "offers_post_production": false
+      },
+      {
+        "studio_id": "studio-102",
+        "studio_name": "Universal Pictures",
+        "is_active": true,
+        "has_backlot": false,
+        "has_soundstage": true,
+        "offers_post_production": true
+      },
+      {
+        "studio_id": "studio-103",
+        "studio_name": "Paramount Pictures",
+        "is_active": true,
+        "has_backlot": true,
+        "has_soundstage": true,
+        "offers_post_production": false
+      },
+      {
+        "studio_id": "studio-104",
+        "studio_name": "Columbia Pictures",
+        "is_active": true,
+        "has_backlot": false,
+        "has_soundstage": false,
+        "offers_post_production": true
+      },
+      {
+        "studio_id": "studio-105",
+        "studio_name": "Walt Disney",
+        "is_active": true,
+        "has_backlot": true,
+        "has_soundstage": true,
+        "offers_post_production": false
+      }
+    ],
+    "maxScore": 1.0,
+    "numFoundExact": true
+  }
+}

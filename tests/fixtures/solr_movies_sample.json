@@ -1,0 +1,61 @@
+{
+  "responseHeader": {
+    "zkConnected": true,
+    "status": 0,
+    "QTime": 3,
+    "params": {
+      "q": "*:*",
+      "wt": "json",
+      "version": "2"
+    }
+  },
+  "response": {
+    "numFound": 3,
+    "start": 0,
+    "docs": [
+      {
+        "movie_id": "movie-101",
+        "title": "Inception Trivia - Spinning Top \ud83d\ude00 \u00e4\u00f6\u00fc",
+        "rating": 8.5,
+        "runtime_minutes": 148,
+        "release_year": 2010,
+        "_version_": 1870516011820646400,
+        "last_updated": "2011-12-14T00:00:00Z",
+        "genres": [
+          "Action",
+          "Sci-Fi",
+          "Adventure"
+        ]
+      },
+      {
+        "movie_id": "movie-102",
+        "title": "The Matrix",
+        "rating": 8.75,
+        "runtime_minutes": 136,
+        "release_year": 1999,
+        "_version_": 1870516011820646402,
+        "last_updated": "2011-12-14T00:00:00Z",
+        "genres": [
+          "Action",
+          "Sci-Fi"
+        ]
+      },
+      {
+        "movie_id": "movie-103",
+        "title": "Interstellar",
+        "rating": 8.5,
+        "runtime_minutes": 169,
+        "release_year": 2014,
+        "_version_": 1870516011820646404,
+        "last_updated": "2014-11-07T00:00:00Z",
+        "genres": [
+          "Sci-Fi",
+          "Adventure",
+          "Drama"
+        ]
+      }
+    ],
+    "maxScore": 1.5,
+    "numFoundExact": true
+  }
+}

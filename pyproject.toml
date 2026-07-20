@@ -1,0 +1,54 @@
+[project]
+name = "javapyn"
+version = "0.1.0"
+description = "Rust-based deserializer for Apache Solr's javabin (protocol v2) format."
+readme = "README.md"
+license = "ISC"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Thomas Oberbichler", email = "thomas.oberbichler@gmail.com" }
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/oberbichler/javapyn"
+Repository = "https://github.com/oberbichler/javapyn"
+Issues = "https://github.com/oberbichler/javapyn/issues"
+
+[project.optional-dependencies]
+arrow = ["pyarrow>=14"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "httpx>=0.28",
+    "orjson>=3.11.9",
+    "pyarrow>=14",
+    "polars>=1",
+    "psutil>=7.2.2",
+    "ruff>=0.15",
+    "ty>=0.0.37",
+]
+
+[tool.maturin]
+module-name = "javapyn._core"
+python-packages = ["javapyn"]
+python-source = "src"
+
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.rs" }, { file = "Cargo.toml" }, { file = "Cargo.lock" }]
+
+[tool.ty.environment]
+# scripts/*.py import javabin_ref_encoder by prepending tests/ to sys.path at
+# runtime; mirror that here so ty can resolve it too.
+extra-paths = ["./tests"]
+
+[build-system]
+requires = ["maturin>=1.14,<2.0"]
+build-backend = "maturin"

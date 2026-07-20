@@ -1,0 +1,83 @@
+{
+  "responseHeader": {
+    "zkConnected": true,
+    "status": 0,
+    "QTime": 1
+  },
+  "response": {
+    "numFound": 5,
+    "start": 0,
+    "docs": [
+      {
+        "movie_id": "movie-101",
+        "title": "Inception Trivia - Spinning Top \ud83d\ude00 \u00e4\u00f6\u00fc",
+        "release_year": 2010,
+        "rating_float": 8.5,
+        "rating_double": 8.5,
+        "is_classic": false,
+        "last_updated": "2011-12-14T00:00:00Z",
+        "genres": [
+          "Action",
+          "Sci-Fi",
+          "Adventure"
+        ]
+      },
+      {
+        "movie_id": "movie-102",
+        "title": "The Matrix",
+        "release_year": 1999,
+        "rating_float": 8.75,
+        "rating_double": 8.75,
+        "is_classic": true,
+        "last_updated": "2011-12-14T00:00:00Z",
+        "genres": [
+          "Action",
+          "Sci-Fi"
+        ]
+      },
+      {
+        "movie_id": "movie-103",
+        "title": "Interstellar",
+        "release_year": 2014,
+        "rating_float": 8.5,
+        "rating_double": 8.5,
+        "is_classic": false,
+        "last_updated": "2014-11-07T00:00:00Z",
+        "genres": [
+          "Sci-Fi",
+          "Adventure",
+          "Drama"
+        ]
+      },
+      {
+        "movie_id": "movie-104",
+        "title": "The Dark Knight",
+        "release_year": 2008,
+        "rating_float": 9.0,
+        "rating_double": 9.0,
+        "is_classic": false,
+        "last_updated": "2008-07-18T00:00:00Z",
+        "genres": [
+          "Action",
+          "Crime",
+          "Drama"
+        ]
+      },
+      {
+        "movie_id": "movie-105",
+        "title": "Pulp Fiction",
+        "release_year": 1994,
+        "rating_float": 8.75,
+        "rating_double": 8.75,
+        "is_classic": true,
+        "last_updated": "1994-10-15T00:00:00Z",
+        "genres": [
+          "Crime",
+          "Drama"
+        ]
+      }
+    ],
+    "maxScore": 1.0,
+    "numFoundExact": true
+  }
+}

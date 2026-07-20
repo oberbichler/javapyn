@@ -1,0 +1,55 @@
+{
+  "responseHeader": {
+    "zkConnected": true,
+    "status": 0,
+    "QTime": 1
+  },
+  "response": {
+    "numFound": 5,
+    "start": 0,
+    "docs": [
+      {
+        "critic_id": "critic-101",
+        "name": "Roger Ebert",
+        "publication": "Chicago Sun-Times",
+        "is_active": true,
+        "total_reviews": 1000,
+        "review_weight": 1.0
+      },
+      {
+        "critic_id": "critic-102",
+        "name": "Gene Siskel",
+        "publication": "Chicago Tribune",
+        "is_active": false,
+        "total_reviews": 1250,
+        "review_weight": 0.875
+      },
+      {
+        "critic_id": "critic-103",
+        "name": "Richard Roeper",
+        "publication": "RichardRoeper.com",
+        "is_active": true,
+        "total_reviews": 1500,
+        "review_weight": 0.75
+      },
+      {
+        "critic_id": "critic-104",
+        "name": "Leonard Maltin",
+        "publication": "Maltin's Movie Guide",
+        "is_active": true,
+        "total_reviews": 1750,
+        "review_weight": 0.625
+      },
+      {
+        "critic_id": "critic-105",
+        "name": "Peter Travers",
+        "publication": "Rolling Stone",
+        "is_active": true,
+        "total_reviews": 2000,
+        "review_weight": 0.5
+      }
+    ],
+    "maxScore": 1.0,
+    "numFoundExact": true
+  }
+}

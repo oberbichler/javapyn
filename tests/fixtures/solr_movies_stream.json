@@ -1,0 +1,34 @@
+{
+  "result-set": {
+    "docs": [
+      {
+        "movie_id": "movie-101",
+        "title": "Inception Trivia - Spinning Top \ud83d\ude00 \u00e4\u00f6\u00fc",
+        "rating": 8.5,
+        "release_year": 2010
+      },
+      {
+        "movie_id": "movie-102",
+        "title": "The Matrix",
+        "rating": 8.75,
+        "release_year": 1999
+      },
+      {
+        "movie_id": "movie-103",
+        "title": "Interstellar",
+        "rating": 8.5,
+        "release_year": 2014
+      },
+      {
+        "movie_id": "movie-104",
+        "title": "The Dark Knight",
+        "rating": 9.0,
+        "release_year": 2008
+      },
+      {
+        "EOF": true,
+        "RESPONSE_TIME": 49
+      }
+    ]
+  }
+}
