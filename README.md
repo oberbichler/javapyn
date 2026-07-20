@@ -1,5 +1,7 @@
 # javapyn
 
+[![PyPI](https://img.shields.io/pypi/v/javapyn.svg)](https://pypi.org/project/javapyn/)
+
 Fast Python deserializer for Apache Solr's javabin (protocol version 2) wire format ([org.apache.solr.common.util.JavaBinCodec](https://github.com/apache/solr/blob/main/solr/solrj/src/java/org/apache/solr/common/util/JavaBinCodec.java)), written in Rust.
 
 ## Why
