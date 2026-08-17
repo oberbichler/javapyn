@@ -50,6 +50,24 @@ jobs:
           content = re.sub(r'(?<=^version = \")[^\"]+', version, content, count=1, flags=re.MULTILINE)
           with open('Cargo.toml', 'w') as f:
               f.write(content)
+
+          # 3. Update the lockfiles, which record this package's own version
+          #    too. Patched by regex rather than by running cargo/uv: this job
+          #    sets up only Python, and both lockfiles carry the same
+          #    name-then-version block for the package itself.
+          for lockfile in ('Cargo.lock', 'uv.lock'):
+              with open(lockfile, 'r') as f:
+                  content = f.read()
+              content, n = re.subn(
+                  r'(?m)^(name = \"javapyn\"\nversion = \")[^\"]+',
+                  lambda m: m.group(1) + version,
+                  content,
+                  count=1,
+              )
+              if n != 1:
+                  raise SystemExit(f'{lockfile}: expected one javapyn version entry, patched {n}')
+              with open(lockfile, 'w') as f:
+                  f.write(content)
           "
           echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
 
@@ -57,7 +75,7 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml Cargo.toml
+          git add pyproject.toml Cargo.toml Cargo.lock uv.lock
           if [ -n "$(git status --porcelain)" ]; then
             git commit -m "chore: bump version to v${{ inputs.version }}"
             git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
