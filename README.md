@@ -43,7 +43,54 @@ Two consequences worth planning for:
 - **Only `/select` nests.** `/export` and `/stream` have no `[child]` transformer, so Solr returns every child as a document of its own, interleaved with the parents; the `_root_` field is the only link back. Add it to `fl` if you need to regroup them.
 - **`deserialize_stream` and `StreamDecoder` emit one callback per *top-level* document**, with its children nested inside — not one callback per document in the index.
 
-`deserialize_arrow` and `ArrowStreamDecoder` produce a flat table, so a nesting field simply has no column: leave it out of the schema and it is skipped, parents becoming the rows. The anonymous shape is rejected instead, since it carries no field name to leave out.
+#### Child documents in the Arrow output
+
+`deserialize_arrow` and `ArrowStreamDecoder` produce a flat table, so a nesting field has no column of its own. What happens to it is up to `children`:
+
+- **`children="skip"`** (the default) leaves the nesting out: the rows are the top-level documents, exactly as before. An anonymous `_childDocuments_` is rejected instead of skipped, since it carries no field name to leave out of the schema.
+- **`children="explode"`** gives every child document a row of its own, at any depth, right after its parent — the same shape `/export` and `/stream` already return, so the mode is a no-op for those.
+
+```python
+schema = pa.schema([
+    ("id", pa.string()),
+    ("title", pa.string()),
+    ("_parent_id", pa.string()),
+    ("_depth", pa.int32()),
+    ("_child_field", pa.string()),
+])
+
+batch = javapyn.deserialize_arrow(resp.content, schema, children="explode")
+pl.from_arrow(batch)
+```
+
+```
+┌───────┬───────────┬────────────┬────────┬──────────────┐
+│ id    │ title     │ _parent_id │ _depth │ _child_field │
+╞═══════╪═══════════╪════════════╪════════╪══════════════╡
+│ book1 │ Book One  │ null       │ 0      │ null         │
+│ ch1   │ Chapter 1 │ book1      │ 1      │ chapters     │
+│ sec1  │ Section A │ ch1        │ 2      │ sections     │
+│ ch2   │ Chapter 2 │ book1      │ 1      │ chapters     │
+└───────┴───────────┴────────────┴────────┴──────────────┘
+```
+
+The three metadata columns are filled only if the schema declares them, and their names are configurable — `child_columns` maps a role to a column name, and `key` names the *source* column a parent's identity is read from:
+
+```python
+javapyn.deserialize_arrow(
+    resp.content, schema, children="explode",
+    child_columns={"parent_id": "parent", "depth": "level", "key": "movie_id"},
+)
+```
+
+| role | default | holds |
+| :--- | :------ | :---- |
+| `parent_id` | `_parent_id` | the **direct** parent's key; null at the top level |
+| `depth` | `_depth` | nesting depth, 0 at the top level |
+| `child_field` | `_child_field` | the field the document hung under; null at the top level |
+| `key` | `id` | *source* column identifying a document (Solr's uniqueKey) |
+
+`_parent_id` names the direct parent, not the root ancestor — `sec1` above points at `ch1`. Note that a second nesting level only arrives if `fl` asks for it: `fl=children,[child]` returns the chapters but not their own nested field, where `fl=*,[child]` returns the whole tree.
 
 `deserialize_json` does the same decoding but serializes directly to a JSON string via `serde_json`, skipping the Python object construction step. Where JSON cannot express what javabin can, the output matches Solr's own `wt=json`: a binary field becomes a base64 string, a non-finite float becomes `"Infinity"`/`"-Infinity"`/`"NaN"`, and a null NamedList name becomes the empty-string key.
 

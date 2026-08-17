@@ -18,6 +18,42 @@ fn decode_error_to_py(err: reader::DecodeError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
+/// Parse the two child-document arguments shared by the Arrow entry points.
+///
+/// Both are validated here rather than ignored: a misspelled mode or role would
+/// otherwise silently give the default behaviour, which is the kind of thing
+/// nobody notices until the rows are wrong.
+fn child_config(
+    children: &str,
+    child_columns: Option<std::collections::HashMap<String, String>>,
+) -> PyResult<(arrow_decoder::ChildMode, arrow_decoder::ChildColumns)> {
+    let mode = match children {
+        "skip" => arrow_decoder::ChildMode::Skip,
+        "explode" => arrow_decoder::ChildMode::Explode,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "children must be \"skip\" or \"explode\", not {other:?}"
+            )));
+        }
+    };
+    let mut columns = arrow_decoder::ChildColumns::default();
+    for (role, name) in child_columns.unwrap_or_default() {
+        match role.as_str() {
+            "parent_id" => columns.parent_id = name,
+            "depth" => columns.depth = name,
+            "child_field" => columns.child_field = name,
+            "key" => columns.key = name,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown child_columns role {other:?}; expected one of \
+                     \"parent_id\", \"depth\", \"child_field\", \"key\""
+                )));
+            }
+        }
+    }
+    Ok((mode, columns))
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 mod _core {
@@ -161,6 +197,14 @@ mod _core {
     ///     One field per desired column. Supported field types: int32, int64,
     ///     float32, float64, bool, string (utf8), binary, timestamp('ms'), and
     ///     ``list_`` of any of those for multi-valued Solr fields.
+    /// children : str, optional
+    ///     What to do with nested child documents: ``"skip"`` (the default) or
+    ///     ``"explode"``. See :func:`deserialize_arrow` in the stub for the
+    ///     metadata columns ``"explode"`` can fill.
+    /// child_columns : dict[str, str], optional
+    ///     Column names for the ``"explode"`` metadata, by role:
+    ///     ``"parent_id"``, ``"depth"``, ``"child_field"`` and the key source
+    ///     ``"key"``. Unspecified roles keep their defaults.
     ///
     /// Returns
     /// -------
@@ -170,19 +214,24 @@ mod _core {
     /// ------
     /// ValueError
     ///     If ``data`` is not valid javabin, a value doesn't fit its column
-    ///     type, the schema uses an unsupported type, or a document has child
-    ///     documents (which a flat table can't represent).
+    ///     type, the schema uses an unsupported type, a metadata column has the
+    ///     wrong type, or (with ``children="skip"``) a document has anonymous
+    ///     child documents, which a flat table can't represent.
     #[pyfunction]
+    #[pyo3(signature = (data, schema, *, children = "skip", child_columns = None))]
     fn deserialize_arrow(
         py: Python<'_>,
         data: &[u8],
         schema: PyArrowType<arrow::datatypes::Schema>,
+        children: &str,
+        child_columns: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<Py<PyAny>> {
         use std::sync::Arc;
+        let (mode, columns) = child_config(children, child_columns)?;
         let schema = Arc::new(schema.0);
         let batch = py
             .detach(|| {
-                let mut dec = arrow_decoder::ArrowDecoder::new(schema)?;
+                let mut dec = arrow_decoder::ArrowDecoder::with_children(schema, mode, &columns)?;
                 dec.decode_response(data)?;
                 dec.finish_batch()
             })
@@ -278,11 +327,18 @@ struct ArrowStreamDecoder {
 #[pymethods]
 impl ArrowStreamDecoder {
     #[new]
-    #[pyo3(signature = (schema, batch_size = 65536))]
-    fn new(schema: PyArrowType<arrow::datatypes::Schema>, batch_size: usize) -> PyResult<Self> {
+    #[pyo3(signature = (schema, batch_size = 65536, *, children = "skip", child_columns = None))]
+    fn new(
+        schema: PyArrowType<arrow::datatypes::Schema>,
+        batch_size: usize,
+        children: &str,
+        child_columns: Option<std::collections::HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let (mode, columns) = child_config(children, child_columns)?;
         let schema = std::sync::Arc::new(schema.0);
         let state =
-            arrow_decoder::ArrowStreamState::new(schema, batch_size).map_err(decode_error_to_py)?;
+            arrow_decoder::ArrowStreamState::with_children(schema, batch_size, mode, &columns)
+                .map_err(decode_error_to_py)?;
         Ok(Self { state })
     }
 
