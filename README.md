@@ -36,7 +36,11 @@ Solr returns nested documents in one of two shapes, and javapyn passes both thro
   docs = javapyn.deserialize(resp.content)["response"]["docs"]
   docs[0]["chapters"][0]["title"]     # a child document, as a plain dict
   ```
-- **Anonymous** — the older shape, from a schema without `_nest_path_`: children have no field name and appear under a `"_childDocuments_"` key on the parent.
+- **Anonymous** — the shape a schema *without* `_nest_path_` produces (an older or hand-written schema, and what indexing through the reserved `_childDocuments_` key gives you): children have no field name of their own and appear under a `"_childDocuments_"` key on the parent.
+  ```python
+  docs[0]["_childDocuments_"][0]["title"]
+  ```
+  Both shapes are covered by the live conformance tests, the anonymous one against a collection that drops `_nest_path_` precisely to reproduce it.
 
 Two consequences worth planning for:
 
@@ -47,7 +51,7 @@ Two consequences worth planning for:
 
 `deserialize_arrow` and `ArrowStreamDecoder` produce a flat table, so a nesting field has no column of its own. What happens to it is up to `children`:
 
-- **`children="skip"`** (the default) leaves the nesting out: the rows are the top-level documents, exactly as before. An anonymous `_childDocuments_` is rejected instead of skipped, since it carries no field name to leave out of the schema.
+- **`children="skip"`** (the default) leaves the nesting out: the rows are the top-level documents, exactly as before. An anonymous `_childDocuments_` is *rejected* rather than skipped — unlike a named child field there is no field name to leave out of the schema, so skipping would drop data with nothing in the schema to hint at it.
 - **`children="explode"`** gives every child document a row of its own, at any depth, right after its parent — the same shape `/export` and `/stream` already return, so the mode is a no-op for those.
 
 ```python
@@ -91,6 +95,13 @@ javapyn.deserialize_arrow(
 | `key` | `id` | *source* column identifying a document (Solr's uniqueKey) |
 
 `_parent_id` names the direct parent, not the root ancestor — `sec1` above points at `ch1`. Note that a second nesting level only arrives if `fl` asks for it: `fl=children,[child]` returns the chapters but not their own nested field, where `fl=*,[child]` returns the whole tree.
+
+Anonymous children explode the same way, with `_child_field` null throughout since they have no field name:
+
+```python
+javapyn.deserialize_arrow(resp.content, schema, children="explode")
+# legacy_parent/null/0, legacy_child_1/legacy_parent/1, legacy_child_2/legacy_parent/1
+```
 
 `deserialize_json` does the same decoding but serializes directly to a JSON string via `serde_json`, skipping the Python object construction step. Where JSON cannot express what javabin can, the output matches Solr's own `wt=json`: a binary field becomes a base64 string, a non-finite float becomes `"Infinity"`/`"-Infinity"`/`"NaN"`, and a null NamedList name becomes the empty-string key.
 
