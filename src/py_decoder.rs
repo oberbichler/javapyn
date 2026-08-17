@@ -22,7 +22,7 @@
 //! table with one-off strings.
 
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 
@@ -188,7 +188,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 let key = self.read_value()?;
                 let val = self.read_value()?;
                 let dict = PyDict::new(self.py);
-                dict.set_item(key, val)?;
+                self.set_map_item(&dict, key, val)?;
                 dict.into_any()
             }
             tag::PRIMITIVE_ARR => self.read_primitive_array()?,
@@ -288,7 +288,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 None => break,
                 Some(key) => {
                     let val = self.read_value()?;
-                    dict.set_item(key, val)?;
+                    self.set_map_item(&dict, key, val)?;
                 }
             }
         }
@@ -537,6 +537,34 @@ impl<'a, 'py> Decoder<'a, 'py> {
         dict.set_item("docs", docs)?;
 
         Ok(dict)
+    }
+
+    /// `dict[key] = val` for a key that came out of the byte stream.
+    ///
+    /// A corrupted stream can put a container where a map key belongs, and
+    /// CPython then raises `TypeError: unhashable type`. Letting that escape
+    /// would break the documented contract that malformed javabin raises
+    /// `ValueError`, so translate it into a decode error. Only this error path is
+    /// affected; a hashable key takes the same single `set_item` call as before.
+    fn set_map_item(
+        &self,
+        dict: &Bound<'py, PyDict>,
+        key: Bound<'py, PyAny>,
+        val: Bound<'py, PyAny>,
+    ) -> Result<()> {
+        let offset = self.reader.pos;
+        dict.set_item(key, val).map_err(|err| {
+            if err.is_instance_of::<PyTypeError>(self.py) {
+                DecodeError::TypeMismatch {
+                    expected: "hashable map key",
+                    found: "unhashable value",
+                    offset,
+                }
+                .into()
+            } else {
+                err
+            }
+        })
     }
 
     /// Read a `NamedList` entry name, which is a string or -- legally -- null.

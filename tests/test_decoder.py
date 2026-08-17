@@ -246,21 +246,23 @@ def test_real_solr_movies_field_values_roundtrip() -> None:
 
 # -- key handling across the map-like tags ------------------------------------
 #
-# javabin has five containers whose entries are (key, value) pairs, and this
-# decoder handles their keys inconsistently. The table below is what the current
-# implementation does; the tests that follow pin it down, and the xfail-ed ones
-# mark the cases where Solr's own reader is more permissive than we are.
+# javabin has five containers whose entries are (key, value) pairs. A null key is
+# legal in all of them and lands under `None`; anything unusable as a dict key is
+# malformed input and raises ValueError, except in a generic MAP, where a
+# non-string key falls back to a list of pairs (Solr writes real, non-string map
+# keys there). The tests that follow pin this table down.
 #
 #   container            null key                container key
 #   MAP                  list of pairs           list of pairs
-#   MAP_ENTRY_ITER       {None: value}           TypeError (unhashable)
-#   MAP_ENTRY            {None: value}           TypeError (unhashable)
-#   NAMED_LST            ValueError              ValueError
-#   ORDERED_MAP          ValueError              ValueError
+#   MAP_ENTRY_ITER       {None: value}           ValueError (unhashable)
+#   MAP_ENTRY            {None: value}           ValueError (unhashable)
+#   NAMED_LST            {None: value}           ValueError
+#   ORDERED_MAP          {None: value}           ValueError
 
 VERSION = b"\x02"
 MAP = b"\x0a"
 MAP_ENTRY_ITER = b"\x11"
+MAP_ENTRY = b"\x13"
 END = b"\x0f"
 NAMED_LST_1 = b"\xc1"  # NamedList with one entry
 ORDERED_MAP_1 = b"\xa1"  # SimpleOrderedMap with one entry
@@ -288,32 +290,19 @@ def test_map_entry_iter_tolerates_a_null_key() -> None:
     assert javabin.deserialize(data) == {None: 1}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a container as a streaming-map key raises TypeError (unhashable), "
-    "but the documented contract for malformed javabin is ValueError",
-)
-def test_unhashable_map_entry_iter_key_raises_value_error() -> None:
-    """A MAP_ENTRY_ITER key that is a container is malformed but well-framed.
+@pytest.mark.parametrize("container", [MAP_ENTRY_ITER, MAP_ENTRY])
+def test_unhashable_map_key_raises_value_error(container: bytes) -> None:
+    """A streaming-map key that is a container is malformed but well-framed.
 
-    ``deserialize`` tries to use the decoded container as a Python dict key and
-    lets the resulting ``TypeError`` escape, while every other malformed-input
-    case raises ``ValueError`` as the API documents. ``deserialize_json`` accepts
-    the same bytes and returns a list of pairs, so the two entry points disagree.
-    Found by mutation-fuzzing real Solr responses (``test_solr_conformance.py``):
-    one flipped byte in a map key reaches this path.
+    Regression test for a defect where the decoder handed the container to
+    CPython as a dict key and let the resulting ``TypeError`` escape, breaking
+    the documented contract that malformed javabin raises ``ValueError``. Found
+    by mutation-fuzzing real Solr responses (``test_solr_conformance.py``): one
+    flipped byte in a map key reaches this path.
     """
-    data = VERSION + MAP_ENTRY_ITER + EMPTY_ARR + SINT_1 + END
+    data = VERSION + container + EMPTY_ARR + SINT_1 + END
 
-    with pytest.raises(ValueError):
-        javabin.deserialize(data)
-
-
-def test_unhashable_map_entry_iter_key_does_not_crash() -> None:
-    """Whatever the exception type, the interpreter must survive."""
-    data = VERSION + MAP_ENTRY_ITER + EMPTY_ARR + SINT_1 + END
-
-    with pytest.raises((ValueError, TypeError)):
+    with pytest.raises(ValueError, match="hashable map key"):
         javabin.deserialize(data)
 
 

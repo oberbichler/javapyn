@@ -586,15 +586,15 @@ def test_every_truncation_of_a_real_response_raises_value_error(
 
 
 def test_corrupted_real_responses_never_crash(corpus: dict[str, bytes]) -> None:
-    """Random byte mutations of real responses must never crash the interpreter
-    or raise an undocumented exception type.
+    """Random byte mutations of real responses must raise ``ValueError`` or
+    decode cleanly -- nothing else.
 
-    ``TypeError`` is tolerated here because a corrupted stream can turn a map key
-    into a container, which the decoder then tries to use as a dict key; see the
-    xfail-ed ``test_unhashable_map_key_raises_value_error`` in
-    ``test_decoder.py``. Everything except ValueError/TypeError -- a Rust panic
-    surfacing as ``pyo3_runtime.PanicException``, say -- is a failure, and a
-    segfault would take the test session down with it.
+    The documented contract is that malformed javabin raises ``ValueError``, so
+    any other exception type is a failure: a Rust panic surfacing as
+    ``pyo3_runtime.PanicException``, or the ``TypeError`` that used to escape when
+    a mutation turned a map key into a container (see
+    ``test_decoder.py::test_unhashable_map_key_raises_value_error``). A segfault
+    would take the whole test session down with it.
     """
     rng = random.Random(20240817)
     mutations = 0
@@ -615,7 +615,7 @@ def test_corrupted_real_responses_never_crash(corpus: dict[str, bytes]) -> None:
             ):
                 try:
                     call()
-                except (ValueError, TypeError, RecursionError, MemoryError):
+                except (ValueError, RecursionError, MemoryError):
                     pass
                 except Exception as exc:  # noqa: BLE001 - the point of the test
                     pytest.fail(

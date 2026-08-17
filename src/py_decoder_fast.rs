@@ -428,7 +428,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 let key = self.read_value()?;
                 let val = self.read_value()?;
                 let dict = self.new_dict()?;
-                self.dict_set(&dict, &key, &val)?;
+                self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
                 dict
             }
             tag::PRIMITIVE_ARR => self.read_primitive_array()?,
@@ -480,6 +480,29 @@ impl<'a, 'py> Decoder<'a, 'py> {
         } else {
             Err(DecodeError::PyErr)
         }
+    }
+
+    /// `dict[key] = val` for a key that came out of the byte stream.
+    ///
+    /// A corrupted stream can put a container where a map key belongs, and
+    /// CPython then raises `TypeError: unhashable type`. Letting that escape
+    /// would break the documented contract that malformed javabin raises
+    /// `ValueError`, so translate it. Only this error path differs from
+    /// [`Self::dict_set`]; a hashable key costs the same single call.
+    fn dict_set_map_key(&self, dict: &Obj, key: &Obj, val: &Obj, offset: usize) -> Result<()> {
+        let rc = unsafe { ffi::PyDict_SetItem(dict.as_ptr(), key.as_ptr(), val.as_ptr()) };
+        if rc == 0 {
+            return Ok(());
+        }
+        if unsafe { ffi::PyErr_ExceptionMatches(ffi::PyExc_TypeError) } != 0 {
+            unsafe { ffi::PyErr_Clear() };
+            return Err(DecodeError::TypeMismatch {
+                expected: "hashable map key",
+                found: "unhashable value",
+                offset,
+            });
+        }
+        Err(DecodeError::PyErr)
     }
 
     /// `dict[key_cstr] = val` for a static ASCII key, via `PyDict_SetItemString`.
@@ -584,7 +607,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 Slot::End => break,
                 Slot::Value(key) | Slot::Child(key) => {
                     let val = self.read_value()?;
-                    self.dict_set(&dict, &key, &val)?;
+                    self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
                 }
             }
         }
@@ -865,7 +888,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 Slot::End => break,
                 Slot::Value(key) | Slot::Child(key) => {
                     let val = self.stream_envelope_value(&key, callback)?;
-                    self.dict_set(&dict, &key, &val)?;
+                    self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
                 }
             }
         }
@@ -921,7 +944,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 Slot::End => break,
                 Slot::Value(key) | Slot::Child(key) => {
                     let val = self.stream_docs_or_value(&key, callback)?;
-                    self.dict_set(&dict, &key, &val)?;
+                    self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
                 }
             }
         }
@@ -937,7 +960,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         for _ in 0..sz {
             let key = self.read_value()?;
             let val = self.stream_docs_or_value(&key, callback)?;
-            self.dict_set(&dict, &key, &val)?;
+            self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
         }
         Ok(dict)
     }
