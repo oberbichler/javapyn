@@ -58,7 +58,10 @@ type Result<T> = std::result::Result<T, DecodeError>;
 /// A javabin scalar value already read from the stream, ready to be appended
 /// to a column (or to be an element of a list column). Borrows string/byte
 /// data from the input buffer to avoid copying until the Arrow builder copies.
-#[derive(Clone, Copy)]
+/// `Clone`, deliberately not `Copy`: only the staging path needs to duplicate a
+/// value, and making the type `Copy` changes the move semantics of every
+/// `read_scalar` result in the flat path too.
+#[derive(Clone)]
 enum Scalar<'a> {
     Null,
     Bool(bool),
@@ -672,11 +675,7 @@ impl ArrowDecoder {
     /// are handled as field-name/value sequences.
     pub fn append_document<'a>(&mut self, r: &mut Reader<'a>) -> Result<()> {
         if self.child_mode == ChildMode::Explode {
-            // Stage the whole document (children included), then append its rows
-            // parent-first. See the ChildMode::Explode section below.
-            let mut rows: Vec<StagedRow<'a>> = Vec::new();
-            self.stage_document(r, &mut rows, 0, None, None)?;
-            return self.append_staged_rows(&rows);
+            return self.append_document_exploded(r);
         }
 
         for s in self.row_seen.iter_mut() {
@@ -724,6 +723,20 @@ impl ArrowDecoder {
     // by byte range to re-parse later would break the `EXTERN_STRING` cache,
     // whose definitions have to enter it in stream order. So a document is
     // staged in one pass, then its rows are appended parent-first.
+
+    /// Append one document as one row per document in its subtree.
+    ///
+    /// Deliberately its own function rather than a branch inside
+    /// [`Self::append_document`]: the staging buffer and the recursion make it
+    /// several times the size of the flat path, and letting that grow the hot
+    /// function costs about 10% throughput on a flat export -- measured, not
+    /// assumed.
+    #[inline(never)]
+    fn append_document_exploded<'a>(&mut self, r: &mut Reader<'a>) -> Result<()> {
+        let mut rows: Vec<StagedRow<'a>> = Vec::new();
+        self.stage_document(r, &mut rows, 0, None, None)?;
+        self.append_staged_rows(&rows)
+    }
 
     /// Stage one document and, recursively, its children. Rows land in `rows`
     /// in pre-order: this document, then each child subtree in field order.
@@ -860,7 +873,7 @@ impl ArrowDecoder {
                 // field written after the child list still links correctly.
                 let key = self.meta.key.expect("validated in MetaColumns::resolve");
                 let value = match row.parent.map(|p| &rows[p].cells[key]) {
-                    Some(Some(StagedCell::Scalar(s))) => *s,
+                    Some(Some(StagedCell::Scalar(s))) => s.clone(),
                     _ => Scalar::Null,
                 };
                 append_scalar(&mut self.builders[c], value)?;
@@ -870,12 +883,12 @@ impl ArrowDecoder {
             for (c, cell) in row.cells.iter().enumerate() {
                 match cell {
                     Some(StagedCell::Scalar(s)) => {
-                        append_scalar(&mut self.builders[c], *s)?;
+                        append_scalar(&mut self.builders[c], s.clone())?;
                         self.row_seen[c] = true;
                     }
                     Some(StagedCell::List(values)) => {
                         for v in values {
-                            append_list_element(&mut self.builders[c], *v)?;
+                            append_list_element(&mut self.builders[c], v.clone())?;
                         }
                         finish_list_row(&mut self.builders[c]);
                         self.row_seen[c] = true;
@@ -1263,6 +1276,7 @@ enum ValueForm {
     Bare,
 }
 
+#[inline(always)]
 fn read_value_form(r: &mut Reader<'_>) -> Result<ValueForm> {
     let t = r.read_u8()?;
     if t >> 5 == 4 {
@@ -1307,6 +1321,7 @@ fn child_value_form(r: &mut Reader<'_>) -> Result<Option<ChildValue>> {
 }
 
 /// Whether the iterator ends here; consumes the `END` marker if so.
+#[inline(always)]
 fn peek_iterator_end(r: &mut Reader<'_>) -> Result<bool> {
     let b = *r
         .data
