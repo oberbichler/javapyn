@@ -1,6 +1,6 @@
 [project]
 name = "javapyn"
-version = "0.1.0"
+version = "0.2.0"
 description = "Rust-based deserializer for Apache Solr's javabin (protocol v2) format."
 readme = "README.md"
 license = "ISC"
