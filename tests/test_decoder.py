@@ -242,3 +242,98 @@ def test_real_solr_movies_field_values_roundtrip() -> None:
     assert second["genres"] == ["Action", "Sci-Fi"]
     assert second["release_year"] == 1999
     assert second["last_updated"] == 1_321_488_000_000
+
+
+# -- key handling across the map-like tags ------------------------------------
+#
+# javabin has five containers whose entries are (key, value) pairs, and this
+# decoder handles their keys inconsistently. The table below is what the current
+# implementation does; the tests that follow pin it down, and the xfail-ed ones
+# mark the cases where Solr's own reader is more permissive than we are.
+#
+#   container            null key                container key
+#   MAP                  list of pairs           list of pairs
+#   MAP_ENTRY_ITER       {None: value}           TypeError (unhashable)
+#   MAP_ENTRY            {None: value}           TypeError (unhashable)
+#   NAMED_LST            ValueError              ValueError
+#   ORDERED_MAP          ValueError              ValueError
+
+VERSION = b"\x02"
+MAP = b"\x0a"
+MAP_ENTRY_ITER = b"\x11"
+END = b"\x0f"
+NAMED_LST_1 = b"\xc1"  # NamedList with one entry
+ORDERED_MAP_1 = b"\xa1"  # SimpleOrderedMap with one entry
+NULL = b"\x00"
+EMPTY_ARR = b"\x80"  # ARR with size 0
+SINT_1 = b"\x41"  # SINT with inline value 1
+
+
+def test_map_tolerates_non_string_keys() -> None:
+    """A MAP with a key that cannot be a dict key falls back to pairs."""
+    assert javabin.deserialize(VERSION + MAP + b"\x01" + EMPTY_ARR + SINT_1) == [
+        [[], 1]
+    ]
+    assert javabin.deserialize(VERSION + MAP + b"\x01" + NULL + SINT_1) == [[None, 1]]
+
+
+def test_map_entry_iter_tolerates_a_null_key() -> None:
+    """A streaming map with a null key decodes to a None-keyed dict.
+
+    This is the shape a fixed :func:`test_named_list_with_null_name_decodes`
+    should produce too -- the decoder already has a representation for it.
+    """
+    data = VERSION + MAP_ENTRY_ITER + NULL + SINT_1 + END
+
+    assert javabin.deserialize(data) == {None: 1}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="a container as a streaming-map key raises TypeError (unhashable), "
+    "but the documented contract for malformed javabin is ValueError",
+)
+def test_unhashable_map_entry_iter_key_raises_value_error() -> None:
+    """A MAP_ENTRY_ITER key that is a container is malformed but well-framed.
+
+    ``deserialize`` tries to use the decoded container as a Python dict key and
+    lets the resulting ``TypeError`` escape, while every other malformed-input
+    case raises ``ValueError`` as the API documents. ``deserialize_json`` accepts
+    the same bytes and returns a list of pairs, so the two entry points disagree.
+    Found by mutation-fuzzing real Solr responses (``test_solr_conformance.py``):
+    one flipped byte in a map key reaches this path.
+    """
+    data = VERSION + MAP_ENTRY_ITER + EMPTY_ARR + SINT_1 + END
+
+    with pytest.raises(ValueError):
+        javabin.deserialize(data)
+
+
+def test_unhashable_map_entry_iter_key_does_not_crash() -> None:
+    """Whatever the exception type, the interpreter must survive."""
+    data = VERSION + MAP_ENTRY_ITER + EMPTY_ARR + SINT_1 + END
+
+    with pytest.raises((ValueError, TypeError)):
+        javabin.deserialize(data)
+
+
+@pytest.mark.parametrize("container", [NAMED_LST_1, ORDERED_MAP_1])
+@pytest.mark.xfail(
+    strict=True,
+    reason="NamedList entries with a null name are rejected; Solr emits one for "
+    "the facet.missing bucket and its own reader casts the name with (String), "
+    "so null is legal on the wire",
+)
+def test_named_list_with_null_name_decodes(container: bytes) -> None:
+    """``NamedList``/``SimpleOrderedMap`` entries may have a null name.
+
+    ``JavaBinCodec.readNamedList`` does ``String name = (String) readVal(dis)``,
+    which yields null for a NULL tag, and Solr writes exactly that for the
+    ``facet.missing`` bucket. javapyn raises instead, which makes an ordinary
+    faceted query undecodable -- see
+    ``test_solr_conformance.py::test_facet_missing_bucket_decodes`` for the live
+    reproduction on Solr 8, 9 and 10.
+    """
+    data = VERSION + container + NULL + SINT_1
+
+    assert javabin.deserialize(data) == {None: 1}

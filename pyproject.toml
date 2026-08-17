@@ -33,8 +33,17 @@ dev = [
     "polars>=1",
     "psutil>=7.2.2",
     "ruff>=0.15",
+    "testcontainers>=4",
     "ty>=0.0.37",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "solr: integration test requiring a running Docker daemon (starts a Solr container)",
+]
+# Container tests are opt-in: `pytest` stays fast and Docker-free,
+# `pytest -m solr` runs them.
+addopts = '-m "not solr"'
 
 [tool.maturin]
 module-name = "javapyn._core"
