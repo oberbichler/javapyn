@@ -152,10 +152,55 @@ impl Value {
     }
 }
 
+/// Convert a decoded float to JSON.
+///
+/// JSON has no literal for the non-finite values, so a `DOUBLE`/`FLOAT` tag
+/// carrying one has to be rendered some other way. Solr's own JSON writer emits
+/// the strings `"Infinity"`, `"-Infinity"` and `"NaN"`, so match that: it keeps
+/// `deserialize_json` a drop-in for `wt=json`, and it is not lossy the way
+/// serde_json's default (null) would be. These reach ordinary responses through
+/// the stats component over large doubles and through overflowing function
+/// queries.
 fn json_from_f64(v: f64) -> serde_json::Value {
-    serde_json::Number::from_f64(v)
-        .map(serde_json::Value::Number)
-        .unwrap_or(serde_json::Value::Null)
+    match serde_json::Number::from_f64(v) {
+        Some(n) => serde_json::Value::Number(n),
+        None if v.is_nan() => serde_json::Value::String("NaN".into()),
+        None if v > 0.0 => serde_json::Value::String("Infinity".into()),
+        None => serde_json::Value::String("-Infinity".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_finite_floats_become_solr_style_strings() {
+        // JSON has no literal for these; Solr's own writer emits strings, and
+        // serde_json's default of null would silently lose the value.
+        let cases = [
+            (f64::INFINITY, r#""Infinity""#),
+            (f64::NEG_INFINITY, r#""-Infinity""#),
+            (f64::NAN, r#""NaN""#),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(Value::Double(input).to_json().to_string(), expected);
+        }
+        assert_eq!(
+            Value::Float(f32::INFINITY).to_json().to_string(),
+            r#""Infinity""#
+        );
+    }
+
+    #[test]
+    fn finite_floats_stay_numbers() {
+        assert_eq!(Value::Double(1.5).to_json().to_string(), "1.5");
+        assert_eq!(Value::Double(-0.0).to_json().to_string(), "-0.0");
+        assert_eq!(
+            Value::Double(f64::MAX).to_json(),
+            serde_json::json!(f64::MAX)
+        );
+    }
 }
 
 /// Count the total number of nodes in a `Value` tree (for benchmarking).

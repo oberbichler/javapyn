@@ -736,19 +736,14 @@ def test_export_error_is_visible_to_streaming_decoders(solr: SolrProbe) -> None:
     assert decoder.count == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="deserialize_json turns non-finite doubles into null (serde_json has "
-    "no Infinity/NaN); deserialize returns inf and Solr's own wt=json writes "
-    'the string "Infinity"',
-)
 def test_deserialize_json_keeps_non_finite_doubles(solr: SolrProbe) -> None:
-    """``deserialize_json`` silently loses infinities.
+    """``deserialize_json`` must not lose infinities.
 
     Reachable from ordinary queries: summing the double extremes overflows in the
-    stats component, and a function query over them does too. ``deserialize``
-    reports ``inf`` faithfully, so the two entry points disagree even though the
-    docstring promises the same shape.
+    stats component, and a function query over them does too. Regression test for
+    a defect where serde_json rendered them as ``null``, so the JSON path
+    disagreed with ``deserialize`` despite promising the same shape. Both now
+    agree with Solr, which writes the string ``"Infinity"``.
     """
     data, ref = solr.request(
         "select",
@@ -761,7 +756,7 @@ def test_deserialize_json_keeps_non_finite_doubles(solr: SolrProbe) -> None:
     assert ref["stats"]["stats_fields"]["t_double"]["sumOfSquares"] == "Infinity"
 
     via_json = json.loads(javabin.deserialize_json(data))
-    assert math.isinf(via_json["stats"]["stats_fields"]["t_double"]["sumOfSquares"])
+    assert via_json["stats"]["stats_fields"]["t_double"]["sumOfSquares"] == "Infinity"
 
 
 # -- scale --------------------------------------------------------------------
