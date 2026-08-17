@@ -8,9 +8,10 @@ of the search components (facets, stats, grouping, highlighting, debug, terms,
 cursors, collapse), error responses, and robustness against truncated and
 corrupted real bytes.
 
-Three tests are ``xfail(strict=True)``: they document defects found by exactly
-this suite, and will fail loudly (XPASS) once those defects are fixed, which is
-the signal to delete the marker.
+Several tests are regression tests for defects this suite found: the rejected
+null NamedList name (``test_facet_missing_bucket_decodes``), the silently
+skipped ``/export`` error (``test_export_error_is_visible_to_streaming_decoders``)
+and the lost infinities (``test_deserialize_json_keeps_non_finite_doubles``).
 
 Requires Docker; deselected by default. Run with ``pytest -m solr``.
 """
@@ -20,7 +21,12 @@ import math
 import random
 
 import pytest
-from javabin_compare import assert_matches_json, floats_match, solr_date_to_millis
+from javabin_compare import (
+    assert_json_path_matches,
+    assert_matches_json,
+    floats_match,
+    solr_date_to_millis,
+)
 from javabin_scanner import ALL_TAGS, ScanError, scan
 from solr_probe import (
     DOC_COUNT,
@@ -237,6 +243,14 @@ COMPONENTS: dict[str, dict[str, object]] = {
     "facet_field": {
         "facet": "true",
         "facet.field": "t_string",
+        "facet.limit": "-1",
+        "rows": "0",
+    },
+    # The bucket for documents missing the field has a *null* NamedList name.
+    "facet_missing": {
+        "facet": "true",
+        "facet.field": "t_string",
+        "facet.missing": "true",
         "facet.limit": "-1",
         "rows": "0",
     },
@@ -627,11 +641,13 @@ def test_corrupted_real_responses_never_crash(corpus: dict[str, bytes]) -> None:
 
 def test_decoders_agree_on_every_real_response(corpus: dict[str, bytes]) -> None:
     """deserialize, deserialize_json, deserialize_stream and StreamDecoder must
-    agree on every real response that carries documents."""
+    agree on every real response."""
     for name, data in corpus.items():
         obj = javabin.deserialize(data)
         # Decoding is deterministic (NaN never compares equal to itself).
         assert _has_nan(obj) or javabin.deserialize(data) == obj, name
+
+        assert_json_path_matches(obj, json.loads(javabin.deserialize_json(data)), name)
 
         docs = _docs_of(obj)
         if docs is None:
