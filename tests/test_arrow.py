@@ -212,6 +212,38 @@ def test_arrow_child_document_errors():
         javabin.deserialize_arrow(msg, schema)
 
 
+def test_arrow_skips_named_child_field():
+    """A named child field has no flat column, so leaving it out of the schema
+    skips it -- and the field *after* it must still land in the right column.
+
+    Regression test: skipping a child field used to consume only half of the
+    child's field list, so later columns were read from inside the child document
+    and silently got wrong values.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from javabin_ref_encoder import NamedList, SolrDoc, SolrDocList, encode
+
+    doc = SolrDoc(
+        fields={
+            "movie_id": "p",
+            # Named nesting: what [child] returns from a schema with _nest_path_.
+            "chapters": [
+                SolrDoc(fields={"movie_id": "c1", "rating": 1.0}),
+                SolrDoc(fields={"movie_id": "c2", "rating": 2.0}),
+            ],
+            "rating": 8.5,
+        }
+    )
+    msg = encode(NamedList([("response", SolrDocList(1, 0, None, True, [doc]))]))
+    schema = pa.schema([("movie_id", pa.string()), ("rating", pa.float32())])
+
+    batch = javabin.deserialize_arrow(msg, schema)
+
+    assert batch.to_pydict() == {"movie_id": ["p"], "rating": [8.5]}
+
+
 def test_arrow_type_mismatch_errors():
     import sys
 

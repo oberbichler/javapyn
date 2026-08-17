@@ -33,8 +33,14 @@
 //! | `List<one of the above>`            | multi-valued field (`ARR`)        |
 //!
 //! A field that is absent from a given document becomes a `null` in that
-//! column (Solr documents are sparse). A document's `_childDocuments_` cannot
-//! be represented in a flat table and is rejected.
+//! column (Solr documents are sparse).
+//!
+//! Nested documents have no flat representation. A *named* child field (what
+//! `[child]` returns from a schema with `_nest_path_`) is simply a field whose
+//! type no column can hold: leave it out of the schema and it is skipped like
+//! any other unwanted field, so the parents become the rows. An *anonymous*
+//! child document (`_childDocuments_`) has no field name to leave out, so it is
+//! rejected.
 
 use std::sync::Arc;
 
@@ -1015,10 +1021,22 @@ fn skip_value(r: &mut Reader<'_>, externs: &mut Vec<String>, depth: u32) -> Resu
             }
         }
         tag::SOLRDOC => {
+            // A document's field list holds `n` *entries*, and an entry is
+            // either a (name, value) pair or -- for an anonymous child document
+            // -- a single value. Skipping one value per entry would consume only
+            // half of a named field list and leave the cursor inside the
+            // document, so peek to tell the two apart.
             let inner = r.read_u8()?;
             let n = r.read_size(inner)?;
             for _ in 0..n {
-                skip_value(r, externs, depth)?;
+                let peek = *r
+                    .data
+                    .get(r.pos)
+                    .ok_or(DecodeError::UnexpectedEof { offset: r.pos })?;
+                if peek != tag::SOLRDOC {
+                    skip_value(r, externs, depth)?; // field name
+                }
+                skip_value(r, externs, depth)?; // field value, or child document
             }
         }
         tag::SOLRDOCLST => {
@@ -1466,6 +1484,63 @@ mod tests {
                 .value(0),
             1_517_270_400_000
         );
+    }
+
+    /// Wrap pre-encoded documents in an `ARR`, the shape a nested child field
+    /// holds (`"chapters": [doc, doc]`).
+    fn v_child_list(docs: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = vec![tag::ARR | docs.len() as u8];
+        for d in docs {
+            b.extend_from_slice(d);
+        }
+        b
+    }
+
+    #[test]
+    fn skips_nested_child_documents_and_keeps_later_fields() {
+        // With `fl=*,[child]` a parent carries its children under the field they
+        // were indexed on, as an ARR of SOLRDOC. That field is not in the schema,
+        // so it has to be skipped -- and skipping it has to land exactly on the
+        // next field, or the values after it are read from inside a child.
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("title", DataType::Utf8, true),
+            Field::new("price", DataType::Float32, true),
+        ]);
+        let children = [
+            doc(&[("id", v_str("ch1")), ("title", v_str("Chapter 1"))]),
+            doc(&[("id", v_str("ch2")), ("title", v_str("Chapter 2"))]),
+        ];
+        let docs = vec![doc(&[
+            ("id", v_str("book1")),
+            ("title", v_str("Book One")),
+            ("chapters", v_child_list(&children)),
+            // Deliberately *after* the nested field: a half-consumed child list
+            // would read this column's value from inside a child document.
+            ("price", v_float(20.0)),
+        ])];
+
+        let batch = decode_test(schema, &select_msg(&docs));
+
+        assert_eq!(batch.num_rows(), 1);
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let titles = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let prices = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), "book1");
+        assert_eq!(titles.value(0), "Book One");
+        assert_eq!(prices.value(0), 20.0);
     }
 
     #[test]

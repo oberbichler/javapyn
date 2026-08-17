@@ -237,6 +237,74 @@ def test_child_documents(solr: SolrProbe) -> None:
     assert grandchildren[0]["t_int"] == 111
 
 
+def test_child_documents_through_every_entry_point(solr: SolrProbe) -> None:
+    """A nested response must decode the same way through all five entry points.
+
+    The streaming decoders emit one callback per *top-level* document, with the
+    children nested inside it -- not one callback per document in the index. The
+    columnar decoders skip the nesting field (it has no flat column type) and
+    still land on the following field: regression test for a skip that consumed
+    only half of a child field list and then read later columns from inside a
+    child document, silently, with no error.
+    """
+    data, _ = solr.request(
+        "select",
+        {"q": "t_string:parent", "fl": "id,t_int,children,[child]", "sort": "id asc"},
+        coll=TYPES_COLLECTION,
+    )
+    parents = javabin.deserialize(data)["response"]["docs"]
+    assert len(parents) == 1
+    assert len(parents[0]["children"]) == 2
+
+    streamed: list = []
+    javabin.deserialize_stream(data, streamed.append)
+    assert streamed == parents
+
+    collected: list = []
+    decoder = javabin.StreamDecoder()
+    for i in range(0, len(data), 7):  # small chunks: children span boundaries
+        decoder.feed(data[i : i + 7], collected.append)
+    decoder.finish()
+    assert collected == parents
+    assert decoder.count == 1
+
+    pa = pytest.importorskip("pyarrow")
+    schema = pa.schema([("id", pa.string()), ("t_int", pa.int32())])
+
+    batch = javabin.deserialize_arrow(data, schema)
+    assert batch.to_pydict() == {"id": ["parent"], "t_int": [1]}
+
+    arrow_decoder = javabin.ArrowStreamDecoder(schema, batch_size=2)
+    batches = [
+        b for i in range(0, len(data), 7) for b in arrow_decoder.feed(data[i : i + 7])
+    ]
+    batches.extend(arrow_decoder.finish())
+    table = pa.Table.from_batches(batches, schema=schema)
+    assert table.to_pydict() == {"id": ["parent"], "t_int": [1]}
+
+
+def test_export_flattens_child_documents(solr: SolrProbe) -> None:
+    """``/export`` has no ``[child]`` transformer, so Solr returns children as
+    documents of their own.
+
+    Worth pinning: the same collection yields 1 document from ``/select`` with
+    ``[child]`` and 21 from ``/export``, and only ``_root_`` ties a child back to
+    its parent. Nothing to nest here -- but it is the behaviour callers have to
+    plan for, and it must stay consistent across the entry points.
+    """
+    data, ref = solr.export(coll=TYPES_COLLECTION)
+
+    docs = javabin.deserialize(data)["response"]["docs"]
+    assert len(docs) == TYPES_DOC_COUNT
+    assert_matches_json(javabin.deserialize(data), ref, "types export")
+    assert not any("children" in doc for doc in docs)
+    assert {"parent", "child_1", "child_2", "grandchild_1"} <= {d["id"] for d in docs}
+
+    streamed: list = []
+    javabin.deserialize_stream(data, streamed.append)
+    assert streamed == docs
+
+
 # -- search component response shapes ----------------------------------------
 
 COMPONENTS: dict[str, dict[str, object]] = {

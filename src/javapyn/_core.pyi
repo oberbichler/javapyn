@@ -26,6 +26,10 @@ def deserialize(data: bytes) -> Any:
         ``facet.missing`` bucket of a field facet -- lands under the ``None``
         key.
 
+        Nested documents keep the shape Solr sent: children returned by the
+        ``[child]`` transformer sit under the field they were indexed on, while
+        the older anonymous form appears under ``"_childDocuments_"``.
+
     Raises
     ------
     ValueError
@@ -154,7 +158,10 @@ def deserialize_arrow(data: bytes, schema: "pyarrow.Schema") -> "pyarrow.RecordB
     ------
     ValueError
         If ``data`` is not valid javabin, a value doesn't fit its column type,
-        the schema uses an unsupported type, or a document has child documents.
+        the schema uses an unsupported type, or a document has *anonymous*
+        child documents (``_childDocuments_``), which carry no field name and
+        so cannot be left out of the schema. A named child field is skipped
+        like any other field absent from the schema.
     """
 
 class ArrowStreamDecoder:

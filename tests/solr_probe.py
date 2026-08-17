@@ -88,9 +88,15 @@ TYPE_FIELDS: tuple[dict[str, Any], ...] = (
 )
 
 #: The subset of type fields that ``/export`` accepts (docValues, single or
-#: multi valued, no text or binary).
+#: multi valued, no text or binary), plus the ``id`` the ``_default`` configset
+#: defines for us.
 TYPE_EXPORT_FIELDS = ",".join(
-    f["name"] for f in TYPE_FIELDS if f["name"] not in ("t_text", "t_huge", "t_blob")
+    ["id"]
+    + [
+        f["name"]
+        for f in TYPE_FIELDS
+        if f["name"] not in ("t_text", "t_huge", "t_blob")
+    ]
 )
 
 INT_MAX, INT_MIN = 2**31 - 1, -(2**31)
