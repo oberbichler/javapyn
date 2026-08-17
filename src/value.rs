@@ -78,7 +78,7 @@ impl Value {
             Value::Double(v) => json_from_f64(*v),
             Value::Date(v) => J::from(*v),
             Value::Str(s) => J::String(s.clone()),
-            Value::Bytes(b) => J::Array(b.iter().map(|byte| J::from(*byte)).collect()),
+            Value::Bytes(b) => J::String(base64_encode(b)),
             Value::List(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Map(entries) => {
                 // JSON objects require string keys; fall back to an array of
@@ -152,6 +152,38 @@ impl Value {
     }
 }
 
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 (RFC 4648, with padding), as Solr's JSON writer emits a
+/// binary field.
+///
+/// Hand-rolled rather than pulled in as a dependency: it is a dozen lines, this
+/// crate ships as a wheel and keeps its dependency list deliberately short, and
+/// the live conformance tests check the output against Solr's own base64.
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        // Pad the group to 24 bits, then take four 6-bit indices; the trailing
+        // ones are replaced by '=' for a short final group.
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let bits = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                let index = (bits >> (18 - 6 * i)) & 0x3F;
+                out.push(BASE64_ALPHABET[index as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// Convert a decoded float to JSON.
 ///
 /// JSON has no literal for the non-finite values, so a `DOUBLE`/`FLOAT` tag
@@ -189,6 +221,36 @@ mod tests {
         assert_eq!(
             Value::Float(f32::INFINITY).to_json().to_string(),
             r#""Infinity""#
+        );
+    }
+
+    #[test]
+    fn base64_matches_rfc_4648_vectors() {
+        let cases = [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "{input:?}");
+        }
+        // Every byte value, so the full alphabet and both pad lengths are hit.
+        let all: Vec<u8> = (0..=255).collect();
+        let encoded = base64_encode(&all);
+        assert_eq!(encoded.len(), 344);
+        assert!(encoded.starts_with("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIj"));
+        assert!(encoded.ends_with("+fr7/P3+/w=="));
+    }
+
+    #[test]
+    fn bytes_become_a_base64_string() {
+        assert_eq!(
+            Value::Bytes(vec![0, 1, 2, 255]).to_json().to_string(),
+            r#""AAEC/w==""#
         );
     }
 
