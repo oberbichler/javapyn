@@ -283,6 +283,78 @@ def test_child_documents_through_every_entry_point(solr: SolrProbe) -> None:
     assert table.to_pydict() == {"id": ["parent"], "t_int": [1]}
 
 
+def test_child_documents_explode_into_arrow_rows(solr: SolrProbe) -> None:
+    """``children="explode"`` turns every nested document into a row of its own.
+
+    The live check that matters is the linking: ``_parent_id`` must name the
+    *direct* parent even though Solr writes a document's own fields around its
+    child list, and the depth must reflect the real nesting -- ``grandchild_1``
+    hangs off ``child_1``, not off ``parent``.
+    """
+    pa = pytest.importorskip("pyarrow")
+
+    # fl=* is needed for the *second* level: naming `children` explicitly returns
+    # the chapters but not their own nested field, so the grandchild would be
+    # missing from the response rather than from the decoding.
+    data, _ = solr.request(
+        "select",
+        {"q": "t_string:parent", "fl": "*,[child]", "sort": "id asc"},
+        coll=TYPES_COLLECTION,
+    )
+    schema = pa.schema(
+        [
+            ("id", pa.string()),
+            ("t_int", pa.int32()),
+            ("_parent_id", pa.string()),
+            ("_depth", pa.int32()),
+            ("_child_field", pa.string()),
+        ]
+    )
+
+    exploded = javabin.deserialize_arrow(data, schema, children="explode").to_pydict()
+
+    assert exploded["id"] == ["parent", "child_1", "grandchild_1", "child_2"]
+    assert exploded["_parent_id"] == [None, "parent", "child_1", "parent"]
+    assert exploded["_depth"] == [0, 1, 2, 1]
+    assert exploded["_child_field"] == [None, "children", "grandchildren", "children"]
+    assert exploded["t_int"] == [1, 11, 111, 12]
+
+    # Every link must point at a document that really is in the table, and every
+    # top-level row must be a document Solr returned as a hit.
+    ids = set(exploded["id"])
+    assert all(parent in ids for parent in exploded["_parent_id"] if parent is not None)
+    top_level = [
+        doc_id
+        for doc_id, depth in zip(exploded["id"], exploded["_depth"])
+        if depth == 0
+    ]
+    assert top_level == ["parent"]
+
+    # The default still yields one row, and the streaming decoder agrees with
+    # the single-shot one even when children span chunk boundaries.
+    assert javabin.deserialize_arrow(data, schema).num_rows == 1
+
+    decoder = javabin.ArrowStreamDecoder(schema, batch_size=2, children="explode")
+    batches = [b for i in range(0, len(data), 7) for b in decoder.feed(data[i : i + 7])]
+    batches.extend(decoder.finish())
+    assert pa.Table.from_batches(batches, schema=schema).to_pydict() == exploded
+
+
+def test_explode_is_a_no_op_for_flat_responses(solr: SolrProbe) -> None:
+    """``/export`` already returns children as documents of their own, so the
+    mode changes nothing there -- the row count stays the document count."""
+    pa = pytest.importorskip("pyarrow")
+
+    data, _ = solr.export(coll=TYPES_COLLECTION)
+    schema = pa.schema([("id", pa.string()), ("_depth", pa.int32())])
+
+    exploded = javabin.deserialize_arrow(data, schema, children="explode")
+
+    assert exploded.num_rows == TYPES_DOC_COUNT
+    assert set(exploded.column("_depth").to_pylist()) == {0}
+    assert exploded.to_pydict() == javabin.deserialize_arrow(data, schema).to_pydict()
+
+
 def test_export_flattens_child_documents(solr: SolrProbe) -> None:
     """``/export`` has no ``[child]`` transformer, so Solr returns children as
     documents of their own.

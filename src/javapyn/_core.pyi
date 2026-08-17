@@ -137,7 +137,13 @@ class StreamDecoder:
     def count(self) -> int:
         """Total number of documents streamed so far."""
 
-def deserialize_arrow(data: bytes, schema: "pyarrow.Schema") -> "pyarrow.RecordBatch":
+def deserialize_arrow(
+    data: bytes,
+    schema: "pyarrow.Schema",
+    *,
+    children: str = "skip",
+    child_columns: dict[str, str] | None = None,
+) -> "pyarrow.RecordBatch":
     """
     Deserialize a Solr ``javabin`` response directly into an Arrow
     ``RecordBatch``, given the target Arrow schema.
@@ -158,10 +164,11 @@ def deserialize_arrow(data: bytes, schema: "pyarrow.Schema") -> "pyarrow.RecordB
     ------
     ValueError
         If ``data`` is not valid javabin, a value doesn't fit its column type,
-        the schema uses an unsupported type, or a document has *anonymous*
-        child documents (``_childDocuments_``), which carry no field name and
-        so cannot be left out of the schema. A named child field is skipped
-        like any other field absent from the schema.
+        the schema uses an unsupported type, ``children``/``child_columns``
+        name something unknown, a metadata column cannot hold what would be
+        written to it, or -- with ``children="skip"`` -- a document has
+        *anonymous* child documents (``_childDocuments_``), which carry no
+        field name and so cannot be left out of the schema.
     """
 
 class ArrowStreamDecoder:
@@ -186,7 +193,18 @@ class ArrowStreamDecoder:
         df = pl.from_arrow(pa.Table.from_batches(batches, schema=schema))
     """
 
-    def __init__(self, schema: "pyarrow.Schema", batch_size: int = 65536) -> None: ...
+    def __init__(
+        self,
+        schema: "pyarrow.Schema",
+        batch_size: int = 65536,
+        *,
+        children: str = "skip",
+        child_columns: dict[str, str] | None = None,
+    ) -> None:
+        """``children`` and ``child_columns`` work exactly as in
+        :func:`deserialize_arrow`. With ``"explode"`` a document's own row and
+        its children's rows are always emitted together, so ``batch_size``
+        remains a lower bound per document rather than an exact row count."""
     def feed(self, chunk: bytes) -> list["pyarrow.RecordBatch"]:
         """Feed one chunk; returns any ``RecordBatch`` objects completed as a
         result (possibly empty)."""

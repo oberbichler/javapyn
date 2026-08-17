@@ -117,6 +117,22 @@ pub enum DecodeError {
 
     #[error("failed to build Arrow RecordBatch: {msg}")]
     ArrowBuild { msg: String },
+
+    #[error(
+        "column '{column}' holds the {role} of a child document, so it must be \
+         {expected}"
+    )]
+    ArrowChildColumnType {
+        column: String,
+        role: &'static str,
+        expected: &'static str,
+    },
+
+    #[error(
+        "column '{parent_id}' holds the parent's key, but the schema has no \
+         '{key}' column to take that key from"
+    )]
+    ArrowChildKeyMissing { parent_id: String, key: String },
 }
 
 pub type Result<T> = std::result::Result<T, DecodeError>;

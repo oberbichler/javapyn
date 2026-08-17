@@ -58,6 +58,10 @@ type Result<T> = std::result::Result<T, DecodeError>;
 /// A javabin scalar value already read from the stream, ready to be appended
 /// to a column (or to be an element of a list column). Borrows string/byte
 /// data from the input buffer to avoid copying until the Arrow builder copies.
+/// `Clone`, deliberately not `Copy`: only the staging path needs to duplicate a
+/// value, and making the type `Copy` changes the move semantics of every
+/// `read_scalar` result in the flat path too.
+#[derive(Clone)]
 enum Scalar<'a> {
     Null,
     Bool(bool),
@@ -334,6 +338,123 @@ fn finish_list_row(col: &mut ColumnBuilder) {
     }
 }
 
+/// What to do with a nested child document.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ChildMode {
+    /// Named child fields are skipped; an anonymous child document is an error.
+    /// A flat table of the top-level documents, which is what a tabular load
+    /// usually wants.
+    #[default]
+    Skip,
+    /// Every child document becomes a row of its own, at any depth, emitted
+    /// after its parent (pre-order).
+    Explode,
+}
+
+/// Column names for [`ChildMode::Explode`]: three optional metadata columns,
+/// plus the field that identifies a document.
+///
+/// A metadata column is filled only if the schema declares it, so the defaults
+/// are free to be underscore-prefixed names that no Solr field would use.
+#[derive(Clone, Debug)]
+pub struct ChildColumns {
+    /// Receives the *direct* parent's key value; null for a top-level document.
+    pub parent_id: String,
+    /// Receives the nesting depth: 0 for a top-level document.
+    pub depth: String,
+    /// Receives the field name the document hung under; null at the top level.
+    pub child_field: String,
+    /// The field identifying a document (Solr's uniqueKey), read to fill
+    /// `parent_id` in the child's row.
+    pub key: String,
+}
+
+impl Default for ChildColumns {
+    fn default() -> Self {
+        Self {
+            parent_id: "_parent_id".to_string(),
+            depth: "_depth".to_string(),
+            child_field: "_child_field".to_string(),
+            key: "id".to_string(),
+        }
+    }
+}
+
+/// [`ChildColumns`] resolved against the schema.
+#[derive(Default)]
+struct MetaColumns {
+    parent_id: Option<usize>,
+    depth: Option<usize>,
+    child_field: Option<usize>,
+    /// The key column, needed only to fill `parent_id`.
+    key: Option<usize>,
+    /// Whether `depth` is an Int64 rather than an Int32 column.
+    depth_is_i64: bool,
+    /// Whether any metadata column exists at all, so the per-row filling can be
+    /// skipped outright in the common case of a schema that declares none.
+    any: bool,
+}
+
+impl MetaColumns {
+    /// Resolve the configured names, rejecting a column that cannot hold what
+    /// would be written to it.
+    fn resolve(schema: &Schema, columns: &ChildColumns) -> Result<Self> {
+        let index = |name: &str| schema.fields().iter().position(|f| f.name() == name);
+        let mut meta = MetaColumns {
+            parent_id: index(&columns.parent_id),
+            depth: index(&columns.depth),
+            child_field: index(&columns.child_field),
+            key: index(&columns.key),
+            depth_is_i64: false,
+            any: false,
+        };
+
+        if let Some(i) = meta.depth {
+            meta.depth_is_i64 = match schema.field(i).data_type() {
+                DataType::Int32 => false,
+                DataType::Int64 => true,
+                _ => {
+                    return Err(DecodeError::ArrowChildColumnType {
+                        column: columns.depth.clone(),
+                        role: "depth",
+                        expected: "of type int32 or int64",
+                    });
+                }
+            };
+        }
+        if let Some(i) = meta.child_field
+            && schema.field(i).data_type() != &DataType::Utf8
+        {
+            return Err(DecodeError::ArrowChildColumnType {
+                column: columns.child_field.clone(),
+                role: "nesting field name",
+                expected: "of type utf8",
+            });
+        }
+        if let Some(i) = meta.parent_id {
+            let Some(k) = meta.key else {
+                return Err(DecodeError::ArrowChildKeyMissing {
+                    parent_id: columns.parent_id.clone(),
+                    key: columns.key.clone(),
+                });
+            };
+            if schema.field(i).data_type() != schema.field(k).data_type() {
+                return Err(DecodeError::ArrowChildColumnType {
+                    column: columns.parent_id.clone(),
+                    role: "parent key",
+                    expected: "the same type as the key column",
+                });
+            }
+        }
+        meta.any = meta.parent_id.is_some() || meta.depth.is_some() || meta.child_field.is_some();
+        Ok(meta)
+    }
+
+    fn contains(&self, col: usize) -> bool {
+        [self.parent_id, self.depth, self.child_field].contains(&Some(col))
+    }
+}
+
 /// The columnar decoder: one builder per schema field, plus a name→column
 /// index map and the javabin `EXTERN_STRING` cache resolved to column indices.
 pub struct ArrowDecoder {
@@ -350,15 +471,29 @@ pub struct ArrowDecoder {
     row_seen: Vec<bool>,
     /// Number of complete rows appended.
     rows: usize,
+    child_mode: ChildMode,
+    /// Metadata columns, resolved from [`ChildColumns`].
+    meta: MetaColumns,
 }
 
 impl ArrowDecoder {
-    pub fn new(schema: Arc<Schema>) -> Result<Self> {
+    /// A decoder over `schema`. `child_mode` decides what nested child
+    /// documents become; see [`ChildMode`].
+    pub fn with_children(
+        schema: Arc<Schema>,
+        child_mode: ChildMode,
+        columns: &ChildColumns,
+    ) -> Result<Self> {
+        let meta = MetaColumns::resolve(&schema, columns)?;
         let mut builders = Vec::with_capacity(schema.fields().len());
         let mut name_to_col = std::collections::HashMap::with_capacity(schema.fields().len());
         for (i, field) in schema.fields().iter().enumerate() {
             builders.push(ColumnBuilder::for_field(field)?);
-            name_to_col.insert(field.name().clone(), i);
+            // A metadata column is written from the nesting structure, never
+            // from a document field that happens to share its name.
+            if !meta.contains(i) {
+                name_to_col.insert(field.name().clone(), i);
+            }
         }
         let n = builders.len();
         Ok(Self {
@@ -368,6 +503,8 @@ impl ArrowDecoder {
             extern_strings: Vec::new(),
             row_seen: vec![false; n],
             rows: 0,
+            child_mode,
+            meta,
         })
     }
 
@@ -536,9 +673,16 @@ impl ArrowDecoder {
     /// (fixed length) or `MAP_ENTRY_ITER` (`END`-terminated) — for `/stream`
     /// result-set rows (including the trailing `{"EOF":true,...}` marker). All
     /// are handled as field-name/value sequences.
-    pub fn append_document(&mut self, r: &mut Reader<'_>) -> Result<()> {
+    pub fn append_document<'a>(&mut self, r: &mut Reader<'a>) -> Result<()> {
+        if self.child_mode == ChildMode::Explode {
+            return self.append_document_exploded(r);
+        }
+
         for s in self.row_seen.iter_mut() {
             *s = false;
+        }
+        if self.meta.any {
+            self.append_top_level_meta()?;
         }
 
         let doc_tag = r.read_u8()?;
@@ -568,6 +712,220 @@ impl ArrowDecoder {
             }
         }
         self.rows += 1;
+        Ok(())
+    }
+
+    // -- ChildMode::Explode ---------------------------------------------------
+    //
+    // A columnar builder is append-only, so a row has to be finished across
+    // *all* columns before the next one starts -- which rules out appending a
+    // child row while the parent's row is half-written. And deferring children
+    // by byte range to re-parse later would break the `EXTERN_STRING` cache,
+    // whose definitions have to enter it in stream order. So a document is
+    // staged in one pass, then its rows are appended parent-first.
+
+    /// Append one document as one row per document in its subtree.
+    ///
+    /// Deliberately its own function rather than a branch inside
+    /// [`Self::append_document`]: the staging buffer and the recursion make it
+    /// several times the size of the flat path, and letting that grow the hot
+    /// function costs about 10% throughput on a flat export -- measured, not
+    /// assumed.
+    #[inline(never)]
+    fn append_document_exploded<'a>(&mut self, r: &mut Reader<'a>) -> Result<()> {
+        let mut rows: Vec<StagedRow<'a>> = Vec::new();
+        self.stage_document(r, &mut rows, 0, None, None)?;
+        self.append_staged_rows(&rows)
+    }
+
+    /// Stage one document and, recursively, its children. Rows land in `rows`
+    /// in pre-order: this document, then each child subtree in field order.
+    fn stage_document<'a>(
+        &mut self,
+        r: &mut Reader<'a>,
+        rows: &mut Vec<StagedRow<'a>>,
+        depth: i32,
+        child_field: Option<String>,
+        parent: Option<usize>,
+    ) -> Result<()> {
+        if depth as u32 > crate::reader::MAX_NESTING_DEPTH {
+            return Err(DecodeError::NestingTooDeep {
+                offset: r.pos,
+                max_depth: crate::reader::MAX_NESTING_DEPTH,
+            });
+        }
+        let me = rows.len();
+        rows.push(StagedRow {
+            cells: std::iter::repeat_with(|| None)
+                .take(self.builders.len())
+                .collect(),
+            depth,
+            child_field,
+            parent,
+        });
+
+        let doc_tag = r.read_u8()?;
+        let hi = doc_tag >> 5;
+        if doc_tag == tag::SOLRDOC || hi == 5 || hi == 6 {
+            let sz = if doc_tag == tag::SOLRDOC {
+                let inner = r.read_u8()?;
+                r.read_size(inner)?
+            } else {
+                r.read_size(doc_tag)?
+            };
+            for _ in 0..sz {
+                self.stage_entry(r, rows, me, depth)?;
+            }
+            Ok(())
+        } else if doc_tag == tag::MAP_ENTRY_ITER {
+            while !peek_iterator_end(r)? {
+                self.stage_entry(r, rows, me, depth)?;
+            }
+            Ok(())
+        } else {
+            Err(DecodeError::TypeMismatch {
+                expected: "SolrDocument or map",
+                found: "other tag",
+                offset: r.pos - 1,
+            })
+        }
+    }
+
+    /// Stage one entry of the document at row index `me`.
+    fn stage_entry<'a>(
+        &mut self,
+        r: &mut Reader<'a>,
+        rows: &mut Vec<StagedRow<'a>>,
+        me: usize,
+        depth: i32,
+    ) -> Result<()> {
+        let key = self.read_entry_key_named(r)?;
+        let (col, name) = match key {
+            EntryKey::AnonymousChild => {
+                return self.stage_document(r, rows, depth + 1, None, Some(me));
+            }
+            EntryKey::Field { col, name } => (col, name),
+        };
+
+        // The value may itself be one or more documents. Nothing between here
+        // and the rewind touches the string cache, so restoring the cursor is
+        // enough to fall back to treating it as an ordinary value.
+        let before = r.pos;
+        match child_value_form(r)? {
+            Some(form) => {
+                let field = self.entry_name_string(&name);
+                match form {
+                    ChildValue::Single => {
+                        self.stage_document(r, rows, depth + 1, Some(field), Some(me))?;
+                    }
+                    ChildValue::Arr(n) => {
+                        for _ in 0..n {
+                            self.stage_document(r, rows, depth + 1, Some(field.clone()), Some(me))?;
+                        }
+                    }
+                    ChildValue::Iter => {
+                        while !peek_iterator_end(r)? {
+                            self.stage_document(r, rows, depth + 1, Some(field.clone()), Some(me))?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            None => {
+                r.pos = before;
+                match col {
+                    Some(c) => {
+                        rows[me].cells[c] = self.stage_value(r, c)?;
+                        Ok(())
+                    }
+                    None => self.skip_value(r),
+                }
+            }
+        }
+    }
+
+    /// Append staged rows in order, filling the metadata columns.
+    fn append_staged_rows(&mut self, rows: &[StagedRow<'_>]) -> Result<()> {
+        for row in rows {
+            for seen in self.row_seen.iter_mut() {
+                *seen = false;
+            }
+
+            if let Some(c) = self.meta.depth {
+                let value = if self.meta.depth_is_i64 {
+                    Scalar::Long(i64::from(row.depth))
+                } else {
+                    Scalar::Int(row.depth)
+                };
+                append_scalar(&mut self.builders[c], value)?;
+                self.row_seen[c] = true;
+            }
+            if let Some(c) = self.meta.child_field {
+                let value = match &row.child_field {
+                    Some(name) => Scalar::Str(name),
+                    None => Scalar::Null,
+                };
+                append_scalar(&mut self.builders[c], value)?;
+                self.row_seen[c] = true;
+            }
+            if let Some(c) = self.meta.parent_id {
+                // The parent's key, taken from its own staged row -- so a key
+                // field written after the child list still links correctly.
+                let key = self.meta.key.expect("validated in MetaColumns::resolve");
+                let value = match row.parent.map(|p| &rows[p].cells[key]) {
+                    Some(Some(StagedCell::Scalar(s))) => s.clone(),
+                    _ => Scalar::Null,
+                };
+                append_scalar(&mut self.builders[c], value)?;
+                self.row_seen[c] = true;
+            }
+
+            for (c, cell) in row.cells.iter().enumerate() {
+                match cell {
+                    Some(StagedCell::Scalar(s)) => {
+                        append_scalar(&mut self.builders[c], s.clone())?;
+                        self.row_seen[c] = true;
+                    }
+                    Some(StagedCell::List(values)) => {
+                        for v in values {
+                            append_list_element(&mut self.builders[c], v.clone())?;
+                        }
+                        finish_list_row(&mut self.builders[c]);
+                        self.row_seen[c] = true;
+                    }
+                    None => {}
+                }
+            }
+
+            for (c, seen) in self.row_seen.iter().enumerate() {
+                if !*seen {
+                    self.builders[c].append_null();
+                }
+            }
+            self.rows += 1;
+        }
+        Ok(())
+    }
+
+    /// Fill the metadata columns of a top-level row appended by the direct path.
+    /// Every such row is at depth 0 with no parent and no nesting field.
+    fn append_top_level_meta(&mut self) -> Result<()> {
+        if let Some(c) = self.meta.depth {
+            let value = if self.meta.depth_is_i64 {
+                Scalar::Long(0)
+            } else {
+                Scalar::Int(0)
+            };
+            append_scalar(&mut self.builders[c], value)?;
+            self.row_seen[c] = true;
+        }
+        for c in [self.meta.child_field, self.meta.parent_id]
+            .into_iter()
+            .flatten()
+        {
+            append_scalar(&mut self.builders[c], Scalar::Null)?;
+            self.row_seen[c] = true;
+        }
         Ok(())
     }
 
@@ -615,6 +973,64 @@ impl ArrowDecoder {
             }
         }
         Ok(())
+    }
+
+    /// Read a document-entry key, keeping the name reachable.
+    ///
+    /// The name is *not* returned as a string: for an `EXTERN_STRING` reference
+    /// it lives in the decoder's own cache, and handing out a borrow of that
+    /// would block the `&mut self` the caller needs next. The staging path pays
+    /// for an owned copy only when the entry turns out to be a child field.
+    fn read_entry_key_named<'a>(&mut self, r: &mut Reader<'a>) -> Result<EntryKey<'a>> {
+        let t = r.read_u8()?;
+        let hi = t >> 5;
+        match hi {
+            1 => {
+                let name = r.read_str_tagged(t)?;
+                Ok(EntryKey::Field {
+                    col: self.name_to_col.get(name).copied(),
+                    name: EntryName::Borrowed(name),
+                })
+            }
+            7 => {
+                let idx = r.read_size(t)?;
+                if idx != 0 {
+                    let name = self
+                        .extern_strings
+                        .get(idx - 1)
+                        .ok_or(DecodeError::UnexpectedEof { offset: r.pos })?;
+                    Ok(EntryKey::Field {
+                        col: self.name_to_col.get(name).copied(),
+                        name: EntryName::Interned(idx - 1),
+                    })
+                } else {
+                    let inner = r.read_u8()?;
+                    let name = r.read_str_tagged(inner)?;
+                    let col = self.name_to_col.get(name).copied();
+                    self.extern_strings.push(name.to_string());
+                    Ok(EntryKey::Field {
+                        col,
+                        name: EntryName::Borrowed(name),
+                    })
+                }
+            }
+            0 if t == tag::SOLRDOC => {
+                r.pos -= 1; // leave the cursor on the child's SOLRDOC tag
+                Ok(EntryKey::AnonymousChild)
+            }
+            _ => Err(DecodeError::TypeMismatch {
+                expected: "field name or child document",
+                found: "other tag",
+                offset: r.pos - 1,
+            }),
+        }
+    }
+
+    fn entry_name_string(&self, name: &EntryName<'_>) -> String {
+        match name {
+            EntryName::Borrowed(s) => (*s).to_string(),
+            EntryName::Interned(i) => self.extern_strings[*i].clone(),
+        }
     }
 
     /// Read a document-entry key. Returns `(column index or None, is_field)`.
@@ -692,85 +1108,133 @@ impl ArrowDecoder {
     /// scalar.
     fn read_value_into_column(&mut self, r: &mut Reader<'_>, i: usize) -> Result<()> {
         if self.builders[i].is_list() {
-            let t = r.read_u8()?;
-            if t >> 5 == 4 {
+            match read_value_form(r)? {
                 // ARR: fixed-length multi-valued field.
-                let n = r.read_size(t)?;
-                for _ in 0..n {
-                    let v = read_scalar(r)?;
-                    append_list_element(&mut self.builders[i], v)?;
+                ValueForm::Arr(n) => {
+                    for _ in 0..n {
+                        let v = read_scalar(r)?;
+                        append_list_element(&mut self.builders[i], v)?;
+                    }
+                    finish_list_row(&mut self.builders[i]);
+                    Ok(())
                 }
-                finish_list_row(&mut self.builders[i]);
-                Ok(())
-            } else if t == tag::ITERATOR {
                 // ITERATOR: /export emits some multi-valued docValues fields as
                 // an END-terminated sequence rather than a fixed-length ARR.
-                loop {
-                    let peek = *r
-                        .data
-                        .get(r.pos)
-                        .ok_or(DecodeError::UnexpectedEof { offset: r.pos })?;
-                    if peek == tag::END {
-                        r.pos += 1;
-                        break;
+                ValueForm::Iter => {
+                    while !peek_iterator_end(r)? {
+                        let v = read_scalar(r)?;
+                        append_list_element(&mut self.builders[i], v)?;
                     }
-                    let v = read_scalar(r)?;
-                    append_list_element(&mut self.builders[i], v)?;
+                    finish_list_row(&mut self.builders[i]);
+                    Ok(())
                 }
-                finish_list_row(&mut self.builders[i]);
-                Ok(())
-            } else if t == tag::NULL {
                 // absent multi-valued field
-                self.builders[i].append_null();
-                Ok(())
-            } else {
+                ValueForm::Null => {
+                    self.builders[i].append_null();
+                    Ok(())
+                }
                 // A multi-valued field encoded as a single scalar: accept it as
                 // a one-element list for robustness.
-                r.pos -= 1;
-                let v = read_scalar(r)?;
-                append_list_element(&mut self.builders[i], v)?;
-                finish_list_row(&mut self.builders[i]);
-                Ok(())
+                ValueForm::Bare => {
+                    let v = read_scalar(r)?;
+                    append_list_element(&mut self.builders[i], v)?;
+                    finish_list_row(&mut self.builders[i]);
+                    Ok(())
+                }
             }
         } else {
             // Scalar column. Solr's /export can emit a single-valued docValues
             // field as a one-element ARR/ITERATOR; take the first element.
-            let t = r.read_u8()?;
-            if t >> 5 == 4 {
-                let n = r.read_size(t)?;
-                if n == 0 {
-                    append_scalar(&mut self.builders[i], Scalar::Null)?;
-                } else {
-                    let first = read_scalar(r)?;
-                    append_scalar(&mut self.builders[i], first)?;
-                    for _ in 1..n {
-                        let _ = read_scalar(r)?;
+            match read_value_form(r)? {
+                ValueForm::Arr(n) => {
+                    if n == 0 {
+                        append_scalar(&mut self.builders[i], Scalar::Null)?;
+                    } else {
+                        let first = read_scalar(r)?;
+                        append_scalar(&mut self.builders[i], first)?;
+                        for _ in 1..n {
+                            let _ = read_scalar(r)?;
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
-            } else if t == tag::ITERATOR {
-                let mut first: Option<Scalar> = None;
-                loop {
-                    let peek = *r
-                        .data
-                        .get(r.pos)
-                        .ok_or(DecodeError::UnexpectedEof { offset: r.pos })?;
-                    if peek == tag::END {
-                        r.pos += 1;
-                        break;
+                ValueForm::Iter => {
+                    let mut first: Option<Scalar> = None;
+                    while !peek_iterator_end(r)? {
+                        let v = read_scalar(r)?;
+                        if first.is_none() {
+                            first = Some(v);
+                        }
                     }
+                    append_scalar(&mut self.builders[i], first.unwrap_or(Scalar::Null))
+                }
+                ValueForm::Null => append_scalar(&mut self.builders[i], Scalar::Null),
+                ValueForm::Bare => {
                     let v = read_scalar(r)?;
-                    if first.is_none() {
-                        first = Some(v);
-                    }
+                    append_scalar(&mut self.builders[i], v)
                 }
-                append_scalar(&mut self.builders[i], first.unwrap_or(Scalar::Null))
-            } else {
-                r.pos -= 1;
-                let v = read_scalar(r)?;
-                append_scalar(&mut self.builders[i], v)
             }
         }
+    }
+
+    /// Read one field value into a staged cell instead of a builder.
+    ///
+    /// Mirrors [`Self::read_value_into_column`] case for case -- they share
+    /// [`read_value_form`] precisely so the two cannot drift apart -- but keeps
+    /// the value for later, because a child document's row has to be appended
+    /// after its parent's.
+    fn stage_value<'a>(
+        &mut self,
+        r: &mut Reader<'a>,
+        col: usize,
+    ) -> Result<Option<StagedCell<'a>>> {
+        let is_list = self.builders[col].is_list();
+        Ok(match read_value_form(r)? {
+            ValueForm::Arr(n) => {
+                let mut values = Vec::with_capacity(if is_list { n } else { 1 });
+                for k in 0..n {
+                    let v = read_scalar(r)?;
+                    if is_list || k == 0 {
+                        values.push(v);
+                    }
+                }
+                if is_list {
+                    Some(StagedCell::List(values))
+                } else {
+                    Some(StagedCell::Scalar(
+                        values.into_iter().next().unwrap_or(Scalar::Null),
+                    ))
+                }
+            }
+            ValueForm::Iter => {
+                let mut values = Vec::new();
+                while !peek_iterator_end(r)? {
+                    let v = read_scalar(r)?;
+                    if is_list || values.is_empty() {
+                        values.push(v);
+                    }
+                }
+                if is_list {
+                    Some(StagedCell::List(values))
+                } else {
+                    Some(StagedCell::Scalar(
+                        values.into_iter().next().unwrap_or(Scalar::Null),
+                    ))
+                }
+            }
+            // A null list column is a null, not an empty list; a null scalar is
+            // a value.
+            ValueForm::Null if is_list => None,
+            ValueForm::Null => Some(StagedCell::Scalar(Scalar::Null)),
+            ValueForm::Bare => {
+                let v = read_scalar(r)?;
+                if is_list {
+                    Some(StagedCell::List(vec![v]))
+                } else {
+                    Some(StagedCell::Scalar(v))
+                }
+            }
+        })
     }
 
     /// Skip one javabin value without materialising it (for non-schema fields
@@ -796,6 +1260,125 @@ impl ArrowDecoder {
     pub fn reset_extern_cache(&mut self) {
         self.extern_strings.clear();
     }
+}
+
+/// The container a field value arrived in. Read once, then consumed by either
+/// the direct-append or the staging path -- the one place that decides how a
+/// value is shaped, so the two paths cannot disagree about it.
+enum ValueForm {
+    /// Fixed-length `ARR` of `n` elements.
+    Arr(usize),
+    /// `END`-terminated `ITERATOR`.
+    Iter,
+    /// The `NULL` tag.
+    Null,
+    /// Not a container: the cursor is left on the value itself.
+    Bare,
+}
+
+#[inline(always)]
+fn read_value_form(r: &mut Reader<'_>) -> Result<ValueForm> {
+    let t = r.read_u8()?;
+    if t >> 5 == 4 {
+        return Ok(ValueForm::Arr(r.read_size(t)?));
+    }
+    Ok(match t {
+        tag::ITERATOR => ValueForm::Iter,
+        tag::NULL => ValueForm::Null,
+        _ => {
+            r.pos -= 1;
+            ValueForm::Bare
+        }
+    })
+}
+
+/// Whether a field's value is one or more child documents.
+///
+/// Returns `None` -- leaving the cursor wherever it got to, for the caller to
+/// restore -- when the value is an ordinary one. Nothing here touches the
+/// `EXTERN_STRING` cache, which is what makes that rewind safe.
+fn child_value_form(r: &mut Reader<'_>) -> Result<Option<ChildValue>> {
+    let peek_is_doc = |r: &Reader<'_>| r.data.get(r.pos) == Some(&tag::SOLRDOC);
+    let t = r.read_u8()?;
+    if t == tag::SOLRDOC {
+        r.pos -= 1;
+        return Ok(Some(ChildValue::Single));
+    }
+    if t >> 5 == 4 {
+        let n = r.read_size(t)?;
+        // An empty ARR is ambiguous (an empty child list and an empty
+        // multi-valued field look identical); treat it as a value, which
+        // contributes no child rows either way.
+        if n > 0 && peek_is_doc(r) {
+            return Ok(Some(ChildValue::Arr(n)));
+        }
+        return Ok(None);
+    }
+    if t == tag::ITERATOR && peek_is_doc(r) {
+        return Ok(Some(ChildValue::Iter));
+    }
+    Ok(None)
+}
+
+/// Whether the iterator ends here; consumes the `END` marker if so.
+#[inline(always)]
+fn peek_iterator_end(r: &mut Reader<'_>) -> Result<bool> {
+    let b = *r
+        .data
+        .get(r.pos)
+        .ok_or(DecodeError::UnexpectedEof { offset: r.pos })?;
+    if b == tag::END {
+        r.pos += 1;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// A document entry's key, as read by [`ArrowDecoder::read_entry_key_named`].
+enum EntryKey<'a> {
+    /// A child document with no field name; the cursor is on its `SOLRDOC` tag.
+    AnonymousChild,
+    Field {
+        col: Option<usize>,
+        name: EntryName<'a>,
+    },
+}
+
+/// Where a field name's characters live.
+enum EntryName<'a> {
+    /// In the input buffer.
+    Borrowed(&'a str),
+    /// In the decoder's `EXTERN_STRING` cache, at this index.
+    Interned(usize),
+}
+
+/// How many child documents a field's value holds. The container tag is already
+/// consumed and the cursor sits on the first child's `SOLRDOC` tag.
+enum ChildValue {
+    /// A bare `SOLRDOC`: a single child.
+    Single,
+    /// `ARR` of `n` children.
+    Arr(usize),
+    /// `END`-terminated `ITERATOR` of children.
+    Iter,
+}
+
+/// One column's value, held until its row can be appended.
+enum StagedCell<'a> {
+    Scalar(Scalar<'a>),
+    List(Vec<Scalar<'a>>),
+}
+
+/// One row waiting to be appended, in [`ChildMode::Explode`].
+///
+/// Rows are collected in pre-order (a document, then its children), and `parent`
+/// indexes the row this document hung under -- resolved to a key value only at
+/// append time, so a key field that appears *after* the child list still links.
+struct StagedRow<'a> {
+    cells: Vec<Option<StagedCell<'a>>>,
+    depth: i32,
+    child_field: Option<String>,
+    parent: Option<usize>,
 }
 
 /// Which kind of document sequence follows the envelope.
@@ -1119,9 +1702,14 @@ enum StreamPhase {
 }
 
 impl ArrowStreamState {
-    pub fn new(schema: Arc<Schema>, batch_size: usize) -> Result<Self> {
+    pub fn with_children(
+        schema: Arc<Schema>,
+        batch_size: usize,
+        child_mode: ChildMode,
+        columns: &ChildColumns,
+    ) -> Result<Self> {
         Ok(Self {
-            dec: ArrowDecoder::new(schema)?,
+            dec: ArrowDecoder::with_children(schema, child_mode, columns)?,
             buf: Vec::new(),
             start: 0,
             phase: StreamPhase::Envelope,
@@ -1405,8 +1993,12 @@ mod tests {
         b
     }
 
+    fn decoder_for(schema: Schema, mode: ChildMode) -> ArrowDecoder {
+        ArrowDecoder::with_children(Arc::new(schema), mode, &ChildColumns::default()).unwrap()
+    }
+
     fn decode_test(schema: Schema, msg: &[u8]) -> RecordBatch {
-        let mut d = ArrowDecoder::new(Arc::new(schema)).unwrap();
+        let mut d = decoder_for(schema, ChildMode::Skip);
         d.decode_response(msg).unwrap();
         d.finish_batch().unwrap()
     }
@@ -1543,6 +2135,262 @@ mod tests {
         assert_eq!(prices.value(0), 20.0);
     }
 
+    /// Decode `msg` in explode mode with the default metadata column names.
+    fn explode_test(schema: Schema, msg: &[u8]) -> RecordBatch {
+        let mut d = decoder_for(schema, ChildMode::Explode);
+        d.decode_response(msg).unwrap();
+        d.finish_batch().unwrap()
+    }
+
+    fn utf8_column(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+        let i = batch.schema().index_of(name).unwrap();
+        let a = batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (0..a.len())
+            .map(|k| (!a.is_null(k)).then(|| a.value(k).to_string()))
+            .collect()
+    }
+
+    fn i32_column(batch: &RecordBatch, name: &str) -> Vec<Option<i32>> {
+        let i = batch.schema().index_of(name).unwrap();
+        let a = batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..a.len())
+            .map(|k| (!a.is_null(k)).then(|| a.value(k)))
+            .collect()
+    }
+
+    /// A parent with two children and one grandchild, with the parent's own
+    /// `id` deliberately written *after* the child list -- the ordering that
+    /// only works if the parent's key is resolved after staging.
+    fn nested_family() -> Vec<Vec<u8>> {
+        let grandchild = doc(&[("id", v_str("s1")), ("title", v_str("Section"))]);
+        let children = [
+            doc(&[
+                ("title", v_str("Chapter 1")),
+                ("sections", v_child_list(&[grandchild])),
+                ("id", v_str("c1")),
+            ]),
+            doc(&[("id", v_str("c2")), ("title", v_str("Chapter 2"))]),
+        ];
+        vec![doc(&[
+            ("title", v_str("Book")),
+            ("chapters", v_child_list(&children)),
+            ("id", v_str("b1")),
+        ])]
+    }
+
+    fn family_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("title", DataType::Utf8, true),
+            Field::new("_parent_id", DataType::Utf8, true),
+            Field::new("_depth", DataType::Int32, true),
+            Field::new("_child_field", DataType::Utf8, true),
+        ])
+    }
+
+    #[test]
+    fn explode_emits_a_row_per_document_in_pre_order() {
+        let batch = explode_test(family_schema(), &select_msg(&nested_family()));
+
+        assert_eq!(batch.num_rows(), 4);
+        assert_eq!(
+            utf8_column(&batch, "id"),
+            ["b1", "c1", "s1", "c2"].map(|s| Some(s.to_string()))
+        );
+        // Each row links to its *direct* parent, even though every `id` here is
+        // written after the child list it belongs to.
+        assert_eq!(
+            utf8_column(&batch, "_parent_id"),
+            [None, Some("b1"), Some("c1"), Some("b1")].map(|s| s.map(str::to_string))
+        );
+        assert_eq!(
+            i32_column(&batch, "_depth"),
+            [Some(0), Some(1), Some(2), Some(1)]
+        );
+        assert_eq!(
+            utf8_column(&batch, "_child_field"),
+            [None, Some("chapters"), Some("sections"), Some("chapters")]
+                .map(|s| s.map(str::to_string))
+        );
+    }
+
+    #[test]
+    fn skip_mode_still_yields_only_top_level_rows() {
+        // The default is unchanged, and declared metadata columns describe what
+        // those rows are: depth 0, no parent, no nesting field.
+        let batch = decode_test(family_schema(), &select_msg(&nested_family()));
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(utf8_column(&batch, "id"), [Some("b1".to_string())]);
+        assert_eq!(i32_column(&batch, "_depth"), [Some(0)]);
+        assert_eq!(utf8_column(&batch, "_parent_id"), [None]);
+    }
+
+    #[test]
+    fn explode_without_metadata_columns_just_adds_rows() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Utf8, true)]);
+
+        let batch = explode_test(schema, &select_msg(&nested_family()));
+
+        assert_eq!(batch.num_rows(), 4);
+    }
+
+    #[test]
+    fn explode_handles_anonymous_child_documents() {
+        // No field name to report, so _child_field stays null -- but the row is
+        // there, where skip mode rejects the document outright.
+        let mut parent = vec![tag::SOLRDOC, tag::ORDERED_MAP | 2];
+        str_field(&mut parent, "id");
+        parent.extend_from_slice(&v_str("p1"));
+        parent.extend_from_slice(&doc(&[("id", v_str("anon"))]));
+
+        let batch = explode_test(family_schema(), &select_msg(&[parent]));
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            utf8_column(&batch, "id"),
+            [Some("p1".to_string()), Some("anon".to_string())]
+        );
+        assert_eq!(utf8_column(&batch, "_child_field"), [None, None]);
+        assert_eq!(
+            utf8_column(&batch, "_parent_id"),
+            [None, Some("p1".to_string())]
+        );
+    }
+
+    #[test]
+    fn explode_keeps_list_columns_of_children() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]);
+        let child = doc(&[("id", v_str("c1")), ("tags", v_list_str(&["x", "y"]))]);
+        let docs = vec![doc(&[
+            ("id", v_str("p1")),
+            ("tags", v_list_str(&["a"])),
+            ("kids", v_child_list(&[child])),
+        ])];
+
+        let batch = explode_test(schema, &select_msg(&docs));
+
+        assert_eq!(batch.num_rows(), 2);
+        let lists = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+        let row_values = |k: usize| {
+            let v = lists.value(k);
+            let a = v.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..a.len())
+                .map(|i| a.value(i).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(row_values(0), ["a"]);
+        assert_eq!(row_values(1), ["x", "y"]);
+    }
+
+    #[test]
+    fn explode_rejects_metadata_columns_it_cannot_write() {
+        let cases: [(Schema, &str); 3] = [
+            (
+                Schema::new(vec![
+                    Field::new("id", DataType::Utf8, true),
+                    Field::new("_depth", DataType::Utf8, true),
+                ]),
+                "int32 or int64",
+            ),
+            (
+                Schema::new(vec![
+                    Field::new("id", DataType::Utf8, true),
+                    Field::new("_child_field", DataType::Int32, true),
+                ]),
+                "utf8",
+            ),
+            (
+                Schema::new(vec![
+                    Field::new("id", DataType::Utf8, true),
+                    Field::new("_parent_id", DataType::Int32, true),
+                ]),
+                "same type as the key column",
+            ),
+        ];
+        for (schema, expected) in cases {
+            let err = match ArrowDecoder::with_children(
+                Arc::new(schema),
+                ChildMode::Explode,
+                &ChildColumns::default(),
+            ) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected a rejection for {expected}"),
+            };
+            assert!(err.contains(expected), "{err}");
+        }
+
+        // A parent key with no column to take it from.
+        let schema = Schema::new(vec![
+            Field::new("title", DataType::Utf8, true),
+            Field::new("_parent_id", DataType::Utf8, true),
+        ]);
+        let err = match ArrowDecoder::with_children(
+            Arc::new(schema),
+            ChildMode::Explode,
+            &ChildColumns::default(),
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a rejection for a parent key with no source column"),
+        };
+        assert!(err.contains("no 'id' column"), "{err}");
+    }
+
+    #[test]
+    fn metadata_column_names_are_configurable() {
+        let schema = Schema::new(vec![
+            Field::new("movie_id", DataType::Utf8, true),
+            Field::new("parent", DataType::Utf8, true),
+            Field::new("level", DataType::Int64, true),
+        ]);
+        let columns = ChildColumns {
+            parent_id: "parent".to_string(),
+            depth: "level".to_string(),
+            child_field: "nested_under".to_string(), // absent: simply not filled
+            key: "movie_id".to_string(),
+        };
+        let child = doc(&[("movie_id", v_str("c1"))]);
+        let docs = vec![doc(&[
+            ("movie_id", v_str("p1")),
+            ("kids", v_child_list(&[child])),
+        ])];
+
+        let mut dec =
+            ArrowDecoder::with_children(Arc::new(schema), ChildMode::Explode, &columns).unwrap();
+        dec.decode_response(&select_msg(&docs)).unwrap();
+        let batch = dec.finish_batch().unwrap();
+
+        assert_eq!(
+            utf8_column(&batch, "parent"),
+            [None, Some("p1".to_string())]
+        );
+        let levels = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!((levels.value(0), levels.value(1)), (0, 1));
+    }
+
     #[test]
     fn map_shaped_response_yields_its_documents() {
         // A failed /export encodes `response` as a plain MAP holding an ARR of
@@ -1618,7 +2466,7 @@ mod tests {
 
         let docs = vec![doc(&[("i", v_sint(1)), ("deep", deep)])];
         let schema = Schema::new(vec![Field::new("i", DataType::Int32, true)]);
-        let mut dec = ArrowDecoder::new(Arc::new(schema)).unwrap();
+        let mut dec = decoder_for(schema, ChildMode::Skip);
         let err = dec.decode_response(&select_msg(&docs)).unwrap_err();
         assert!(err.to_string().contains("nesting"), "{err}");
     }

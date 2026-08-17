@@ -244,6 +244,117 @@ def test_arrow_skips_named_child_field():
     assert batch.to_pydict() == {"movie_id": ["p"], "rating": [8.5]}
 
 
+def _nested_message():
+    """A book with two chapters and one section, three levels deep.
+
+    Each document's ``id`` is written *after* its child list, which is the
+    ordering that only works if the parent key is resolved after staging.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from javabin_ref_encoder import NamedList, SolrDoc, SolrDocList, encode
+
+    section = SolrDoc(fields={"id": "s1", "title": "Section"})
+    chapters = [
+        SolrDoc(fields={"title": "Chapter 1", "sections": [section], "id": "c1"}),
+        SolrDoc(fields={"title": "Chapter 2", "id": "c2"}),
+    ]
+    book = SolrDoc(fields={"title": "Book", "chapters": chapters, "id": "b1"})
+    return encode(NamedList([("response", SolrDocList(1, 0, None, True, [book]))]))
+
+
+NESTED_SCHEMA = pa.schema(
+    [
+        ("id", pa.string()),
+        ("title", pa.string()),
+        ("_parent_id", pa.string()),
+        ("_depth", pa.int32()),
+        ("_child_field", pa.string()),
+    ]
+)
+
+
+def test_arrow_explode_emits_one_row_per_document():
+    batch = javabin.deserialize_arrow(
+        _nested_message(), NESTED_SCHEMA, children="explode"
+    )
+
+    assert batch.to_pydict() == {
+        # Pre-order: a document, then its children.
+        "id": ["b1", "c1", "s1", "c2"],
+        "title": ["Book", "Chapter 1", "Section", "Chapter 2"],
+        "_parent_id": [None, "b1", "c1", "b1"],
+        "_depth": [0, 1, 2, 1],
+        "_child_field": [None, "chapters", "sections", "chapters"],
+    }
+
+
+def test_arrow_skip_is_the_default():
+    batch = javabin.deserialize_arrow(_nested_message(), NESTED_SCHEMA)
+
+    assert batch.to_pydict() == {
+        "id": ["b1"],
+        "title": ["Book"],
+        "_parent_id": [None],
+        "_depth": [0],
+        "_child_field": [None],
+    }
+
+
+def test_arrow_explode_metadata_columns_are_renameable():
+    schema = pa.schema(
+        [("id", pa.string()), ("parent", pa.string()), ("level", pa.int64())]
+    )
+
+    batch = javabin.deserialize_arrow(
+        _nested_message(),
+        schema,
+        children="explode",
+        child_columns={"parent_id": "parent", "depth": "level"},
+    )
+
+    assert batch.to_pydict() == {
+        "id": ["b1", "c1", "s1", "c2"],
+        "parent": [None, "b1", "c1", "b1"],
+        "level": [0, 1, 2, 1],
+    }
+
+
+def test_arrow_stream_decoder_explodes_across_chunk_boundaries():
+    data = _nested_message()
+
+    for chunk in (1, 5, len(data)):
+        decoder = javabin.ArrowStreamDecoder(
+            NESTED_SCHEMA, batch_size=2, children="explode"
+        )
+        batches = [
+            b
+            for i in range(0, len(data), chunk)
+            for b in decoder.feed(data[i : i + chunk])
+        ]
+        batches.extend(decoder.finish())
+        table = pa.Table.from_batches(batches, schema=NESTED_SCHEMA)
+
+        assert table.column("id").to_pylist() == ["b1", "c1", "s1", "c2"], chunk
+        assert table.column("_parent_id").to_pylist() == [None, "b1", "c1", "b1"], chunk
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        ({"children": "nope"}, 'must be "skip" or "explode"'),
+        (
+            {"children": "explode", "child_columns": {"nope": "x"}},
+            "unknown child_columns role",
+        ),
+    ],
+)
+def test_arrow_child_arguments_are_validated(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        javabin.deserialize_arrow(_nested_message(), NESTED_SCHEMA, **kwargs)
+
+
 def test_arrow_type_mismatch_errors():
     import sys
 
