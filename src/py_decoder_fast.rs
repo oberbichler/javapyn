@@ -172,7 +172,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
             5 | 6 => {
                 let sz = self.reader.read_size(t)?;
                 for _ in 0..sz {
-                    let name = self.expect_str()?;
+                    let name = self.expect_name()?;
                     if let Some(p) = self.envelope_value_to_docs(&name)? {
                         return Ok(p);
                     }
@@ -214,7 +214,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                     // response as NamedList: find its docs entry
                     let sz = self.reader.read_size(t)?;
                     for _ in 0..sz {
-                        let name = self.expect_str()?;
+                        let name = self.expect_name()?;
                         if let Some(p) = self.docs_entry(&name)? {
                             return Ok(Some(p));
                         }
@@ -508,7 +508,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         let sz = self.reader.read_size(tag_byte)?;
         let dict = self.new_dict()?;
         for _ in 0..sz {
-            let name = self.expect_str()?;
+            let name = self.expect_name()?;
             let val = self.read_value()?;
             self.dict_set(&dict, &name, &val)?;
         }
@@ -775,14 +775,20 @@ impl<'a, 'py> Decoder<'a, 'py> {
         Ok(dict)
     }
 
-    fn expect_str(&mut self) -> Result<Obj> {
+    /// Read a `NamedList` entry name, which is a string or -- legally -- null.
+    ///
+    /// See `py_decoder::Decoder::expect_name`. A null name is returned as
+    /// `None`, which [`obj_as_str`] reports as "not a string", so the envelope
+    /// walkers below simply never match it against `response`/`docs`.
+    fn expect_name(&mut self) -> Result<Obj> {
         let offset = self.reader.pos;
         let v = self.read_value()?;
-        if unsafe { ffi::PyUnicode_Check(v.as_ptr()) } != 0 {
+        let is_str = unsafe { ffi::PyUnicode_Check(v.as_ptr()) } != 0;
+        if is_str || v.as_ptr() == unsafe { ffi::Py_None() } {
             Ok(v)
         } else {
             Err(DecodeError::TypeMismatch {
-                expected: "string",
+                expected: "string or null",
                 found: "non-string",
                 offset,
             })
@@ -830,7 +836,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         let sz = self.reader.read_size(tag_byte)?;
         let dict = self.new_dict()?;
         for _ in 0..sz {
-            let name = self.expect_str()?;
+            let name = self.expect_name()?;
             let val = self.stream_envelope_value(&name, callback)?;
             self.dict_set(&dict, &name, &val)?;
         }
@@ -883,7 +889,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         let sz = self.reader.read_size(tag_byte)?;
         let dict = self.new_dict()?;
         for _ in 0..sz {
-            let name = self.expect_str()?;
+            let name = self.expect_name()?;
             let val = self.stream_docs_or_value(&name, callback)?;
             self.dict_set(&dict, &name, &val)?;
         }

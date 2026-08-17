@@ -28,7 +28,12 @@ pub enum Value {
     Map(Vec<(Value, Value)>),
     /// A javabin `NAMED_LST` / `ORDERED_MAP` / `SIMPLE_MAP` (string-keyed,
     /// order-preserving, keys may repeat).
-    NamedList(Vec<(String, Value)>),
+    ///
+    /// An entry name is `None` when it was written as the `NULL` tag. That is
+    /// legal on the wire -- `JavaBinCodec.readNamedList` reads the name with
+    /// `(String) readVal(dis)`, which yields null -- and Solr does it in
+    /// practice for the `facet.missing` bucket of a field facet.
+    NamedList(Vec<(Option<String>, Value)>),
     /// A javabin `SOLRDOC`. Child documents (added via Solr's nested/child
     /// document feature) are kept separate from regular fields, mirroring
     /// `SolrDocument.getChildDocuments()`.
@@ -100,7 +105,9 @@ impl Value {
             Value::NamedList(entries) => {
                 let mut map = serde_json::Map::new();
                 for (k, v) in entries {
-                    map.insert(k.clone(), v.to_json());
+                    // JSON has no null keys. Solr's own JSON writer renders a
+                    // null map key as the empty string, so match that.
+                    map.insert(k.clone().unwrap_or_default(), v.to_json());
                 }
                 J::Object(map)
             }

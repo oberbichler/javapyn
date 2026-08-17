@@ -237,7 +237,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         let sz = self.reader.read_size(tag_byte)?;
         let dict = PyDict::new(self.py);
         for _ in 0..sz {
-            let name = self.expect_str()?;
+            let name = self.expect_name()?;
             let val = self.read_value()?;
             dict.set_item(name, val)?;
         }
@@ -539,18 +539,24 @@ impl<'a, 'py> Decoder<'a, 'py> {
         Ok(dict)
     }
 
-    fn expect_str(&mut self) -> Result<Bound<'py, PyString>> {
+    /// Read a `NamedList` entry name, which is a string or -- legally -- null.
+    ///
+    /// `JavaBinCodec.readNamedList` casts the name with `(String) readVal(...)`,
+    /// so a `NULL` tag yields a null name, and Solr writes one for the
+    /// `facet.missing` bucket of a field facet. Such an entry lands under the
+    /// `None` key. Anything else in a name position is malformed.
+    fn expect_name(&mut self) -> Result<Bound<'py, PyAny>> {
         let offset = self.reader.pos;
-        match self.read_value()? {
-            v if v.is_instance_of::<PyString>() => {
-                Ok(v.cast_into::<PyString>().expect("checked above"))
-            }
-            _ => Err(DecodeError::TypeMismatch {
-                expected: "string",
+        let value = self.read_value()?;
+        if value.is_instance_of::<PyString>() || value.is_none() {
+            Ok(value)
+        } else {
+            Err(DecodeError::TypeMismatch {
+                expected: "string or null",
                 found: "non-string",
                 offset,
             }
-            .into()),
+            .into())
         }
     }
 }

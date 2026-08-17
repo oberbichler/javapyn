@@ -318,22 +318,34 @@ def test_unhashable_map_entry_iter_key_does_not_crash() -> None:
 
 
 @pytest.mark.parametrize("container", [NAMED_LST_1, ORDERED_MAP_1])
-@pytest.mark.xfail(
-    strict=True,
-    reason="NamedList entries with a null name are rejected; Solr emits one for "
-    "the facet.missing bucket and its own reader casts the name with (String), "
-    "so null is legal on the wire",
-)
 def test_named_list_with_null_name_decodes(container: bytes) -> None:
     """``NamedList``/``SimpleOrderedMap`` entries may have a null name.
 
     ``JavaBinCodec.readNamedList`` does ``String name = (String) readVal(dis)``,
     which yields null for a NULL tag, and Solr writes exactly that for the
-    ``facet.missing`` bucket. javapyn raises instead, which makes an ordinary
-    faceted query undecodable -- see
+    ``facet.missing`` bucket, so such an entry lands under the ``None`` key --
+    the same representation ``MAP_ENTRY_ITER`` already used. See
     ``test_solr_conformance.py::test_facet_missing_bucket_decodes`` for the live
     reproduction on Solr 8, 9 and 10.
     """
     data = VERSION + container + NULL + SINT_1
 
     assert javabin.deserialize(data) == {None: 1}
+
+
+@pytest.mark.parametrize("container", [NAMED_LST_1, ORDERED_MAP_1])
+def test_null_named_list_name_becomes_empty_json_key(container: bytes) -> None:
+    """JSON has no null keys, so a null name becomes ``""`` -- which is what
+    Solr's own JSON writer does with a null map key."""
+    data = VERSION + container + NULL + SINT_1
+
+    assert json.loads(javabin.deserialize_json(data)) == {"": 1}
+
+
+@pytest.mark.parametrize("container", [NAMED_LST_1, ORDERED_MAP_1])
+def test_named_list_rejects_a_container_name(container: bytes) -> None:
+    """A name that is neither a string nor null is malformed input."""
+    data = VERSION + container + EMPTY_ARR + SINT_1
+
+    with pytest.raises(ValueError, match="string or null"):
+        javabin.deserialize(data)

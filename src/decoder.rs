@@ -207,11 +207,11 @@ impl<'a> Decoder<'a> {
         Ok(items)
     }
 
-    fn read_named_list(&mut self, tag_byte: u8) -> Result<Vec<(String, Value)>> {
+    fn read_named_list(&mut self, tag_byte: u8) -> Result<Vec<(Option<String>, Value)>> {
         let sz = self.reader.read_size(tag_byte)?;
         let mut entries = Vec::with_capacity(self.reader.capacity_hint(sz));
         for _ in 0..sz {
-            let name = self.expect_str()?;
+            let name = self.expect_name()?;
             let val = self.read_value()?;
             entries.push((name, val));
         }
@@ -258,8 +258,8 @@ impl<'a> Decoder<'a> {
         let int_val = self.read_value()?;
         let str_val = self.read_value()?;
         Ok(Value::NamedList(vec![
-            ("int".to_string(), int_val),
-            ("string".to_string(), str_val),
+            (Some("int".to_string()), int_val),
+            (Some("string".to_string()), str_val),
         ]))
     }
 
@@ -409,12 +409,18 @@ impl<'a> Decoder<'a> {
         })
     }
 
-    fn expect_str(&mut self) -> Result<String> {
+    /// Read a `NamedList` entry name, which may be null.
+    ///
+    /// `JavaBinCodec.readNamedList` casts the name with `(String) readVal(...)`,
+    /// so a `NULL` tag simply yields a null name; Solr writes one for the
+    /// `facet.missing` bucket. Anything else in a name position is malformed.
+    fn expect_name(&mut self) -> Result<Option<String>> {
         let offset = self.reader.pos;
         match self.read_value()? {
-            Value::Str(s) => Ok(s),
+            Value::Str(s) => Ok(Some(s)),
+            Value::Null => Ok(None),
             other => Err(DecodeError::TypeMismatch {
-                expected: "string",
+                expected: "string or null",
                 found: value_kind(&other),
                 offset,
             }),
@@ -631,8 +637,42 @@ mod tests {
         body.push(tag::SINT | 1);
         assert_eq!(
             decode(&with_version(body)).unwrap(),
-            Value::NamedList(vec![("a".to_string(), Value::Int(1))])
+            Value::NamedList(vec![(Some("a".to_string()), Value::Int(1))])
         );
+    }
+
+    #[test]
+    fn decodes_named_list_with_null_name() {
+        // NamedList{null: 12} -- what Solr writes for the facet.missing bucket.
+        for container in [tag::NAMED_LST, tag::ORDERED_MAP] {
+            let body = vec![container | 1, tag::NULL, tag::SINT | 12];
+            assert_eq!(
+                decode(&with_version(body)).unwrap(),
+                Value::NamedList(vec![(None, Value::Int(12))]),
+                "container {container:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_list_rejects_a_non_string_non_null_name() {
+        // A container in a name position is malformed, not merely unnamed.
+        let body = vec![tag::NAMED_LST | 1, tag::ARR, tag::SINT | 1];
+        assert!(matches!(
+            decode(&with_version(body)),
+            Err(DecodeError::TypeMismatch {
+                expected: "string or null",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn null_named_list_name_becomes_an_empty_json_key() {
+        // JSON has no null keys; Solr's own JSON writer uses "" for one.
+        let body = vec![tag::NAMED_LST | 1, tag::NULL, tag::SINT | 12];
+        let json = decode(&with_version(body)).unwrap().to_json();
+        assert_eq!(json.to_string(), r#"{"":12}"#);
     }
 
     #[test]

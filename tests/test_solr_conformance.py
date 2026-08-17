@@ -674,19 +674,13 @@ def _has_nan(obj: object) -> bool:
 # -- defects this suite found -------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="NamedList entries with a null name are rejected; Solr emits one for "
-    "the facet.missing bucket (JavaBinCodec casts the name with (String), so "
-    "null is legal on the wire)",
-)
 def test_facet_missing_bucket_decodes(solr: SolrProbe) -> None:
     """``facet.missing=true`` adds a bucket whose NamedList *name* is null.
 
-    Solr's own reader tolerates it; javapyn raises
-    ``ValueError: expected string ... found non-string``, so an ordinary faceted
-    query is undecodable. Reproduces on Solr 8.11, 9.10 and 10.0, for string and
-    numeric fields, with both facet methods.
+    Solr writes the name as a NULL tag and its own reader tolerates it, so the
+    bucket lands under the ``None`` key. Regression test for a defect that made
+    any faceted query with ``facet.missing`` undecodable on Solr 8.11, 9.10 and
+    10.0, for string and numeric fields, with both facet methods.
     """
     data, ref = solr.request(
         "select",
