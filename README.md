@@ -27,7 +27,7 @@ json_text = javapyn.deserialize_json(response.content)
 
 `deserialize` returns native Python objects: dict, list, str, int, float, bool, bytes, None. SolrDocumentList values (the response key of a query result) are shaped like Solr's own `wt=json` response: `{"numFound", "start", "maxScore", "numFoundExact", "docs"}`. Child documents (Solr's nested/child-document feature) appear under a `"_childDocuments_"` key on the parent document.
 
-`deserialize_json` does the same decoding but serializes directly to a JSON string via `serde_json`, skipping the Python object construction step.
+`deserialize_json` does the same decoding but serializes directly to a JSON string via `serde_json`, skipping the Python object construction step. Where JSON cannot express what javabin can, the output matches Solr's own `wt=json`: a binary field becomes a base64 string, a non-finite float becomes `"Infinity"`/`"-Infinity"`/`"NaN"`, and a null NamedList name becomes the empty-string key.
 
 ### Supported endpoints
 
@@ -250,17 +250,19 @@ TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock uv run pytest -m solr
 
 A Solr container started the same way also serves as a fixture source — `scripts/fetch_sample.py --base-url http://localhost:<port>/solr --collection solr_movies` captures new fixtures from it — so adding fixtures no longer requires access to an internal Solr.
 
-### Known defects
+### Defects this suite found
 
-Three `xfail(strict=True)` tests document defects that the conformance suite found. They pass as failures today and will fail loudly once fixed, which is the signal to remove the marker.
+Five, all fixed and covered by regression tests. They are listed here because each one changes what you get back:
 
 | Defect | Effect |
 | :----- | :----- |
-| A `NamedList` entry with a null name is rejected | `facet.missing=true` makes a response undecodable. Solr writes a NULL name for the missing bucket and its own reader accepts it (`(String) readVal(...)`). Reproduces on Solr 8, 9 and 10, for string and numeric fields, with both facet methods. `tests/test_decoder.py::test_named_list_with_null_name_decodes` |
-| A failed `/export` is invisible to the streaming decoders | `deserialize` returns the `EXCEPTION` document, but `deserialize_stream` and `StreamDecoder` report zero documents and raise nothing, so a failed export is indistinguishable from an empty one unless the caller checks the HTTP status. The error response encodes `response` as a MAP holding a plain ARR instead of the MAP_ENTRY_ITER + ITERATOR shape of a successful export. |
-| `deserialize_json` loses non-finite doubles | ±Infinity and NaN become `null` (serde_json has no literal for them), while `deserialize` returns `inf` and Solr's own `wt=json` writes `"Infinity"`. Reachable from `stats.field` on large doubles and from function queries that overflow. |
+| A `NamedList` entry with a null name was rejected | Any `facet.missing=true` response was undecodable (`ValueError: expected string`). Solr writes a NULL name for the missing bucket and its own reader accepts it (`(String) readVal(...)`). Reproduced on Solr 8, 9 and 10, for string and numeric fields, with both facet methods. Such an entry now lands under the `None` key. |
+| A failed `/export` was invisible to the streaming decoders | `deserialize` returned the `EXCEPTION` document, but `deserialize_stream`, `StreamDecoder` and `deserialize_arrow` reported zero documents and raised nothing, so a failed export was indistinguishable from an empty one. The error response encodes `response` as a MAP holding a plain ARR rather than the MAP_ENTRY_ITER + ITERATOR of a successful export; all envelope walkers now know that shape. |
+| `StreamDecoder.finish()` accepted a truncated stream | It returned successfully whenever the envelope had not been parsed, so feeding a lone version byte reported a clean, empty result. It now reports truncation unless the document sequence actually terminated. |
+| `deserialize_json` lost non-finite doubles | ±Infinity and NaN became `null`. Both now render as `"Infinity"`/`"-Infinity"`/`"NaN"`, as Solr's own writer does. Reachable from `stats.field` over large doubles and from overflowing function queries. |
+| A container as a map key raised `TypeError` | Malformed javabin is documented to raise `ValueError`; a corrupted `MAP_ENTRY_ITER` key let CPython's `TypeError: unhashable type` escape instead. Found by mutation-fuzzing real responses. |
 
-Two smaller inconsistencies are pinned by `tests/test_decoder.py` rather than fixed: a container used as a key in a `MAP_ENTRY_ITER` raises `TypeError` instead of the documented `ValueError` (found by mutation-fuzzing real responses), and `deserialize_json` renders a binary field as an array of integers where Solr's `wt=json` uses base64.
+One deliberate output change came with them: `deserialize_json` now renders a binary field as base64 rather than an array of integers, matching `wt=json`.
 
 Tags that live Solr never emits in a query response — `BYTE`, `SHORT`, `MAP_ENTRY`, `ENUM_FIELD_VALUE`, `PRIMITIVE_ARR`, `SOLRINPUTDOC`, `UUID` — stay covered by the Rust unit tests and the reference encoder alone. Notably a Solr `UUIDField` serialises as a plain `STR`, so javabin's `UUID` tag (which this decoder rejects) is not reachable through a schema.
 
