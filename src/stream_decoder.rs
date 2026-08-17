@@ -136,24 +136,30 @@ impl StreamState {
     /// Signal end of input. Errors if the stream ended mid-document or before
     /// the document sequence terminated.
     pub fn finish(&mut self, py: Python<'_>) -> PyResult<()> {
-        match self.phase {
-            Phase::Done => Ok(()),
-            Phase::DocsIter | Phase::DocsArr { .. } | Phase::Envelope => {
-                // If everything that remains is the trailing END markers of an
-                // already-emptied iterator we could be lenient, but a clean
-                // finish should have reached Done. Treat leftover as an error
-                // only if documents are still expected.
-                match self.phase {
-                    Phase::DocsArr { remaining } if remaining > 0 => Err(err_to_py(
-                        py,
-                        DecodeError::UnexpectedEof {
-                            offset: self.buf.len(),
-                        },
-                    )),
-                    _ => Ok(()),
-                }
-            }
+        let truncated = match self.phase {
+            Phase::Done => false,
+            // Documents are still expected.
+            Phase::DocsArr { remaining } => remaining > 0,
+            // Still waiting for the envelope: the input ended before the
+            // wrapper was even understood, so nothing could have been streamed.
+            // Being lenient here would let a truncated response (in the extreme,
+            // a lone version byte) pass as an empty result.
+            Phase::Envelope => true,
+            // An ITERATOR whose trailing END never arrived. The documents seen
+            // so far were complete and have been emitted, so this is the one
+            // case where leniency is defensible -- but the stream is still
+            // truncated, and callers rely on finish() to say so.
+            Phase::DocsIter => true,
+        };
+        if truncated {
+            return Err(err_to_py(
+                py,
+                DecodeError::UnexpectedEof {
+                    offset: self.buf.len(),
+                },
+            ));
         }
+        Ok(())
     }
 
     /// Consume as many complete units from the pending buffer as possible.
@@ -368,6 +374,28 @@ mod tests {
         b
     }
 
+    /// Failed-/export-style: MAP_ENTRY_ITER{"response": MAP size=2 {"docs":
+    /// ARR[ n docs ], "numFound": 0}} END. This is what Solr answers when the
+    /// export request itself is rejected, with the error as the one document.
+    fn map_response_msg(n: u8) -> Vec<u8> {
+        let mut b = vec![V, tag::MAP_ENTRY_ITER];
+        b.push(tag::STR | 8);
+        b.extend_from_slice(b"response");
+        b.push(tag::MAP);
+        b.push(2); // vint size, not the 5-bit inline size of NAMED_LST
+        b.push(tag::STR | 4);
+        b.extend_from_slice(b"docs");
+        b.push(tag::ARR | n);
+        for k in 0..n {
+            doc(k, &mut b);
+        }
+        b.push(tag::STR | 8);
+        b.extend_from_slice(b"numFound");
+        b.push(tag::SLONG);
+        b.push(tag::END); // map_entry_iter
+        b
+    }
+
     /// Feed `msg` in chunks of `chunk` bytes; collect the "i" field of each
     /// streamed doc into a Vec<i64>.
     fn stream_collect(py: Python<'_>, msg: &[u8], chunk: usize) -> Vec<i64> {
@@ -408,6 +436,62 @@ mod tests {
             for chunk in 1..=msg.len() {
                 let got = stream_collect(py, &msg, chunk);
                 assert_eq!(got, expected, "chunk size {chunk}");
+            }
+        });
+    }
+
+    #[test]
+    fn map_shaped_response_all_chunk_sizes_yield_same_docs() {
+        // A failed /export encodes `response` as a plain MAP holding an ARR of
+        // documents. Missing that shape meant a failed export streamed nothing
+        // and raised nothing, so it looked exactly like an empty one.
+        Python::attach(|py| {
+            let msg = map_response_msg(1);
+            for chunk in 1..=msg.len() {
+                assert_eq!(
+                    stream_collect(py, &msg, chunk),
+                    vec![0],
+                    "chunk size {chunk}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn finish_errors_when_the_envelope_never_completed() {
+        // A lone version byte used to finish cleanly with zero documents.
+        Python::attach(|py| {
+            let mut st = StreamState::new();
+            let cb = PyList::empty(py).getattr("append").unwrap();
+            st.feed(py, &[V], cb.as_ptr()).unwrap();
+            assert!(st.finish(py).is_err());
+            assert_eq!(st.count(), 0);
+        });
+    }
+
+    #[test]
+    fn finish_errors_on_a_truncated_document_sequence() {
+        // Every prefix that stops before the document iterator's END is
+        // truncated input, even when every document seen so far was complete.
+        // stream_msg ends with two END bytes: the iterator's, then the enclosing
+        // MAP_ENTRY_ITER's. Once the first has arrived the document sequence is
+        // complete, and trailing envelope bytes are ignored by design.
+        Python::attach(|py| {
+            let msg = stream_msg(3);
+            let iterator_end = msg.len() - 2;
+            for cut in 1..=iterator_end {
+                let mut st = StreamState::new();
+                let cb = PyList::empty(py).getattr("append").unwrap();
+                st.feed(py, &msg[..cut], cb.as_ptr()).unwrap();
+                assert!(st.finish(py).is_err(), "prefix of {cut} bytes");
+            }
+            for cut in [iterator_end + 1, msg.len()] {
+                let mut st = StreamState::new();
+                let collected = PyList::empty(py);
+                let cb = collected.getattr("append").unwrap();
+                st.feed(py, &msg[..cut], cb.as_ptr()).unwrap();
+                st.finish(py).unwrap();
+                assert_eq!(st.count(), 3, "prefix of {cut} bytes");
             }
         });
     }

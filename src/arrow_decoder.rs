@@ -469,6 +469,18 @@ impl ArrowDecoder {
                     }
                     return Ok(Some(DocsSeq::None));
                 }
+                // A plain MAP: the shape /export answers with when the request
+                // failed, holding `docs` as an ARR with one EXCEPTION document.
+                _ if t == tag::MAP => {
+                    let sz = r.read_vint()? as usize;
+                    for _ in 0..sz {
+                        let name = self.read_envelope_name(r)?;
+                        if let Some(p) = self.docs_entry(r, name.as_deref())? {
+                            return Ok(Some(p));
+                        }
+                    }
+                    return Ok(Some(DocsSeq::None));
+                }
                 _ => {
                     r.pos -= 1;
                     self.skip_value(r)?;
@@ -1304,6 +1316,26 @@ mod tests {
         b
     }
 
+    /// Build a failed-`/export` message: MAP_ENTRY_ITER{"response": MAP size=2
+    /// {"docs": ARR[docs], "numFound": 0}} END. Solr answers with this shape
+    /// when the export request itself is rejected, the error being the one
+    /// document.
+    fn map_response_msg(docs: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = vec![V, tag::MAP_ENTRY_ITER];
+        str_field(&mut b, "response");
+        b.push(tag::MAP);
+        b.push(2); // vint size, not NAMED_LST's 5-bit inline size
+        str_field(&mut b, "docs");
+        b.push(tag::ARR | docs.len() as u8);
+        for d in docs {
+            b.extend_from_slice(d);
+        }
+        str_field(&mut b, "numFound");
+        b.push(tag::SLONG);
+        b.push(tag::END);
+        b
+    }
+
     /// Encode one SOLRDOC from (field-name, encoded-value) pairs.
     fn doc(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut b = vec![tag::SOLRDOC, tag::ORDERED_MAP | fields.len() as u8];
@@ -1433,6 +1465,28 @@ mod tests {
                 .unwrap()
                 .value(0),
             1_517_270_400_000
+        );
+    }
+
+    #[test]
+    fn map_shaped_response_yields_its_documents() {
+        // A failed /export encodes `response` as a plain MAP holding an ARR of
+        // documents. Skipping that shape made deserialize_arrow return zero rows
+        // for it, indistinguishable from an empty export.
+        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let docs = vec![doc(&[("s", v_str("No sort criteria was provided."))])];
+
+        let batch = decode_test(schema, &map_response_msg(&docs));
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "No sort criteria was provided."
         );
     }
 

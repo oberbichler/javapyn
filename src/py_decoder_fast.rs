@@ -244,6 +244,21 @@ impl<'a, 'py> Decoder<'a, 'py> {
                         }
                         return Ok(Some(DocsPhase::None));
                     }
+                    // A plain MAP: what /export answers with when the request
+                    // itself failed, holding `docs` as an ARR with a single
+                    // `{"EXCEPTION": ...}` document. Without this arm the error
+                    // document is never streamed and a failed export is
+                    // indistinguishable from an empty one.
+                    tag::MAP => {
+                        let sz = self.reader.read_vint()? as usize;
+                        for _ in 0..sz {
+                            let name = self.read_value()?;
+                            if let Some(p) = self.docs_entry(&name)? {
+                                return Ok(Some(p));
+                            }
+                        }
+                        return Ok(Some(DocsPhase::None));
+                    }
                     _ => {
                         self.reader.pos -= 1;
                         let _ = self.read_value()?;
@@ -870,6 +885,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 _ => match t {
                     tag::SOLRDOCLST => return self.stream_solr_doc_list(callback),
                     tag::MAP_ENTRY_ITER => return self.stream_response_map_entry_iter(callback),
+                    tag::MAP => return self.stream_response_map(callback),
                     _ => {
                         self.reader.pos -= 1;
                     }
@@ -908,6 +924,20 @@ impl<'a, 'py> Decoder<'a, 'py> {
                     self.dict_set(&dict, &key, &val)?;
                 }
             }
+        }
+        Ok(dict)
+    }
+
+    /// A `response` encoded as a plain `MAP` (a fixed number of entries rather
+    /// than `END`-terminated): what `/export` answers with when the request
+    /// failed, carrying the `EXCEPTION` document under `docs`.
+    fn stream_response_map(&mut self, callback: *mut ffi::PyObject) -> Result<Obj> {
+        let sz = self.reader.read_vint()? as usize;
+        let dict = self.new_dict()?;
+        for _ in 0..sz {
+            let key = self.read_value()?;
+            let val = self.stream_docs_or_value(&key, callback)?;
+            self.dict_set(&dict, &key, &val)?;
         }
         Ok(dict)
     }

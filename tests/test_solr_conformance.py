@@ -703,20 +703,15 @@ def test_facet_missing_bucket_decodes(solr: SolrProbe) -> None:
     assert counts[None] == ref_counts[-1]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a failed /export decodes to an EXCEPTION document via deserialize, "
-    "but the streaming decoders report zero documents and no error",
-)
 def test_export_error_is_visible_to_streaming_decoders(solr: SolrProbe) -> None:
     """A failed ``/export`` must not look like an empty one.
 
     Without a sort parameter Solr answers HTTP 400 with
-    ``response.docs[0].EXCEPTION``, encoded as a MAP holding a plain ARR instead
-    of the MAP_ENTRY_ITER + ITERATOR shape of a successful export. ``deserialize``
-    surfaces the exception; ``deserialize_stream`` and ``StreamDecoder`` yield no
-    documents and raise nothing, so a caller that does not check the HTTP status
-    cannot tell a failed export from an empty result.
+    ``response.docs[0].EXCEPTION``, encoding ``response`` as a plain MAP holding
+    an ARR instead of the MAP_ENTRY_ITER + ITERATOR shape of a successful export.
+    Regression test for a defect where every streaming path skipped that shape,
+    so a caller that did not check the HTTP status could not tell a failed export
+    from an empty result.
     """
     data = solr.raw(
         "export",
@@ -729,8 +724,16 @@ def test_export_error_is_visible_to_streaming_decoders(solr: SolrProbe) -> None:
     assert "EXCEPTION" in full["response"]["docs"][0]
 
     streamed: list = []
-    javabin.deserialize_stream(data, streamed.append)
+    envelope = javabin.deserialize_stream(data, streamed.append)
     assert streamed == full["response"]["docs"]
+    assert envelope["response"]["docs"] == []
+
+    collected: list = []
+    decoder = javabin.StreamDecoder()
+    decoder.feed(data, collected.append)
+    decoder.finish()
+    assert collected == full["response"]["docs"]
+    assert decoder.count == 1
 
 
 @pytest.mark.xfail(
