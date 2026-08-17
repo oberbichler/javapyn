@@ -9,44 +9,20 @@ equality against a ``wt=json`` response captured in the same request batch.
 
 import json
 import random as _random
-import re
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from javabin_compare import assert_docs_match as _assert_docs_match
 
 import javapyn as javabin
 
 FIXTURES = Path(__file__).parent / "fixtures"
-
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
-
-
-def _solr_date_to_millis(iso: str) -> int:
-    """Parse a Solr ``tdate`` JSON string (``YYYY-MM-DDTHH:MM:SSZ``, optionally
-    with fractional seconds) into milliseconds since the Unix epoch, matching
-    the javabin ``DATE`` tag's representation.
-    """
-    fmt = "%Y-%m-%dT%H:%M:%S.%fZ" if "." in iso else "%Y-%m-%dT%H:%M:%SZ"
-    dt = datetime.strptime(iso, fmt).replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
 
 
 def _load_fixture(name: str) -> tuple[bytes, dict]:
     data = (FIXTURES / f"{name}.bin").read_bytes()
     ref = json.loads((FIXTURES / f"{name}.json").read_text())
     return data, ref
-
-
-def _assert_docs_match(got_docs: list[dict], ref_docs: list[dict]) -> None:
-    assert len(got_docs) == len(ref_docs)
-    for got, expected in zip(got_docs, ref_docs):
-        for key, expected_value in expected.items():
-            got_value = got.get(key)
-            if isinstance(expected_value, str) and _ISO_DATE_RE.match(expected_value):
-                assert got_value == _solr_date_to_millis(expected_value), key
-            else:
-                assert got_value == expected_value, key
 
 
 def test_live_sample_matches_json_reference() -> None:

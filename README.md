@@ -207,13 +207,62 @@ Use `--release` for cargo test and maturin develop.
 
 ## Testing strategy
 
-The decoder is validated three ways:
+The decoder is validated four ways:
 
 1. Rust unit tests hand-construct byte sequences for each tag type per the JavaBinCodec spec and assert the decoded result. Fast-path tests assert it decodes identically to the safe path. Reference-leak and error-path cleanup of the unsafe ffi code are checked from Python.
 2. Python integration tests use an independent reference encoder (tests/javabin_ref_encoder.py) to build realistic response shapes (modeled on the movie Solr collection schema) and verify round-tripping.
 3. Live-modeled fixture tests (tests/test_live_fixtures.py) replay real-world modeled wt=javabin byte responses captured from several Solr movie and studio collections and assert field-by-field equality against a wt=json response.
+4. Live conformance tests (tests/test_solr_container.py) start a real Solr in a container and compare against bytes from Solr's own JavaBinCodec.
 
 All Solr movie and studio collections in int2 have been verified this way with fl=\*. Supported types include string, int, long, float, bool, tdate (plus multi-valued arrays).
+
+### Live Solr conformance tests
+
+The first three layers all rest on our own reading of the javabin spec — the reference encoder shares any blind spot with the decoder, and the fixtures are frozen captures. The container tests make Apache Solr itself the reference: each one issues the same query twice, as `wt=javabin` and as `wt=json`, and asserts the decoded bytes equal what Solr says the result is (`tests/javabin_compare.py` knows every legitimate difference between the two renderings — dates as millis, float32 rounding, binary as base64, non-finite doubles as strings, NamedLists rendered flat — and treats everything else as a defect).
+
+Two collections are provisioned (`tests/solr_probe.py`): `solr_movies` with 2 000 documents for scale and streaming, and `solr_types` with one document per awkward case. Coverage:
+
+- **Every field type**: string, text, binary, boolean, pint, plong, pfloat, pdouble, pdate, and multi-valued variants of each — so INT/LONG/FLOAT/DOUBLE/DATE/BYTEARR come from Solr's encoder, not ours.
+- **Awkward values**: `Integer`/`Long` limits, ±`Float`/`Double` max, denormals, negative zero, the SINT/SLONG inline-vs-vint boundaries, the STR inline-size boundary, a 200 000-character string, non-BMP and ZWJ Unicode, dates before 1970 and with fractional seconds, absent fields, nested child documents two levels deep.
+- **Component response shapes**: field/range/query/pivot/interval facets, JSON facets, stats with percentiles, all four grouping modes, highlighting, debug, terms, cursor paging, collapse/expand, function-query fields, and error responses (HTTP 400 is a javabin response too).
+- **All three handlers**: `/select`, `/export` (including non-empty exports), and eight `/stream` expression types.
+- **Framing cross-check**: `tests/javabin_scanner.py` is an independent pure-Python scanner that walks the tag stream without touching the Rust decoder. Every real response must be consumed exactly, so two independent implementations agree on where every value ends. It also asserts which tags the live suite actually exercises, so shrinking coverage becomes a test failure.
+- **Robustness**: every prefix of every real response must raise `ValueError` (a truncated response is what a dropped connection looks like), and thousands of random byte mutations must never crash the interpreter or raise an undocumented exception type.
+
+They need Docker and are deselected by default, so the normal `uv run pytest` stays fast and Docker-free:
+
+```sh
+uv run pytest -m solr
+```
+
+The Solr image is pinned (`solr:9.10.1`); override it to check another release. CI runs one release per supported major, since a javabin change in a new Solr has to surface here:
+
+```sh
+JAVAPYN_SOLR_IMAGE=solr:8.11.4 uv run pytest -m solr
+JAVAPYN_SOLR_IMAGE=solr:10.0.0 uv run pytest -m solr
+```
+
+Without a reachable Docker daemon the tests skip rather than fail. With [Colima](https://github.com/abiosoft/colima) instead of Docker Desktop, Testcontainers cannot bind-mount Colima's socket path into its reaper container; point it at the in-VM socket:
+
+```sh
+TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock uv run pytest -m solr
+```
+
+A Solr container started the same way also serves as a fixture source — `scripts/fetch_sample.py --base-url http://localhost:<port>/solr --collection solr_movies` captures new fixtures from it — so adding fixtures no longer requires access to an internal Solr.
+
+### Known defects
+
+Three `xfail(strict=True)` tests document defects that the conformance suite found. They pass as failures today and will fail loudly once fixed, which is the signal to remove the marker.
+
+| Defect | Effect |
+| :----- | :----- |
+| A `NamedList` entry with a null name is rejected | `facet.missing=true` makes a response undecodable. Solr writes a NULL name for the missing bucket and its own reader accepts it (`(String) readVal(...)`). Reproduces on Solr 8, 9 and 10, for string and numeric fields, with both facet methods. `tests/test_decoder.py::test_named_list_with_null_name_decodes` |
+| A failed `/export` is invisible to the streaming decoders | `deserialize` returns the `EXCEPTION` document, but `deserialize_stream` and `StreamDecoder` report zero documents and raise nothing, so a failed export is indistinguishable from an empty one unless the caller checks the HTTP status. The error response encodes `response` as a MAP holding a plain ARR instead of the MAP_ENTRY_ITER + ITERATOR shape of a successful export. |
+| `deserialize_json` loses non-finite doubles | ±Infinity and NaN become `null` (serde_json has no literal for them), while `deserialize` returns `inf` and Solr's own `wt=json` writes `"Infinity"`. Reachable from `stats.field` on large doubles and from function queries that overflow. |
+
+Two smaller inconsistencies are pinned by `tests/test_decoder.py` rather than fixed: a container used as a key in a `MAP_ENTRY_ITER` raises `TypeError` instead of the documented `ValueError` (found by mutation-fuzzing real responses), and `deserialize_json` renders a binary field as an array of integers where Solr's `wt=json` uses base64.
+
+Tags that live Solr never emits in a query response — `BYTE`, `SHORT`, `MAP_ENTRY`, `ENUM_FIELD_VALUE`, `PRIMITIVE_ARR`, `SOLRINPUTDOC`, `UUID` — stay covered by the Rust unit tests and the reference encoder alone. Notably a Solr `UUIDField` serialises as a plain `STR`, so javabin's `UUID` tag (which this decoder rejects) is not reachable through a schema.
 
 To capture new live-modeled fixtures, use a small script (scripts/fetch_sample.py):
 

@@ -87,3 +87,38 @@ jobs:
           uv venv --python ${{ matrix.python-version }}
           uvx maturin develop
           uv run --python ${{ matrix.python-version }} pytest
+
+  test-solr:
+    name: Test against live Solr ${{ matrix.solr }}
+    # Own job, not a matrix entry of test-python: these tests need a Docker
+    # daemon, which the macOS and Windows runners don't provide.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # One release per supported major: the point of these tests is that
+        # Solr's own encoder agrees with this decoder, so a javabin change in a
+        # new major has to show up here.
+        solr: ["8.11.4", "9.10.1", "10.0.0"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Build
+        run: |
+          uv venv --python 3.14
+          uvx maturin develop
+
+      - name: Run Solr container tests
+        run: uv run --python 3.14 pytest -m solr
+        env:
+          JAVAPYN_SOLR_IMAGE: solr:${{ matrix.solr }}
