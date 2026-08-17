@@ -22,6 +22,10 @@ def deserialize(data: bytes) -> Any:
         holding a ``dict`` shaped like ``{"numFound", "start", "maxScore",
         "numFoundExact", "docs"}``.
 
+        A ``NamedList`` entry whose name is null -- which Solr writes for the
+        ``facet.missing`` bucket of a field facet -- lands under the ``None``
+        key.
+
     Raises
     ------
     ValueError
@@ -44,7 +48,16 @@ def deserialize_json(data: bytes) -> str:
     -------
     str
         The decoded value serialized as JSON, using the same shape as
-        :func:`deserialize`.
+        :func:`deserialize`, except where JSON cannot express what javabin
+        can. In those three cases the output matches what Solr's own
+        ``wt=json`` writes, so this stays a drop-in replacement for it:
+
+        - a binary field (``BYTEARR``) becomes a base64 string rather than
+          ``bytes``;
+        - a non-finite float becomes the string ``"Infinity"``,
+          ``"-Infinity"`` or ``"NaN"``;
+        - a null ``NamedList`` name becomes the empty-string key rather than
+          ``None``.
 
     Raises
     ------

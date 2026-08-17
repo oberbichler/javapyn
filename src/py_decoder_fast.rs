@@ -172,7 +172,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
             5 | 6 => {
                 let sz = self.reader.read_size(t)?;
                 for _ in 0..sz {
-                    let name = self.expect_str()?;
+                    let name = self.expect_name()?;
                     if let Some(p) = self.envelope_value_to_docs(&name)? {
                         return Ok(p);
                     }
@@ -214,7 +214,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                     // response as NamedList: find its docs entry
                     let sz = self.reader.read_size(t)?;
                     for _ in 0..sz {
-                        let name = self.expect_str()?;
+                        let name = self.expect_name()?;
                         if let Some(p) = self.docs_entry(&name)? {
                             return Ok(Some(p));
                         }
@@ -237,6 +237,21 @@ impl<'a, 'py> Decoder<'a, 'py> {
                             if self.peek_end()? {
                                 break;
                             }
+                            let name = self.read_value()?;
+                            if let Some(p) = self.docs_entry(&name)? {
+                                return Ok(Some(p));
+                            }
+                        }
+                        return Ok(Some(DocsPhase::None));
+                    }
+                    // A plain MAP: what /export answers with when the request
+                    // itself failed, holding `docs` as an ARR with a single
+                    // `{"EXCEPTION": ...}` document. Without this arm the error
+                    // document is never streamed and a failed export is
+                    // indistinguishable from an empty one.
+                    tag::MAP => {
+                        let sz = self.reader.read_vint()? as usize;
+                        for _ in 0..sz {
                             let name = self.read_value()?;
                             if let Some(p) = self.docs_entry(&name)? {
                                 return Ok(Some(p));
@@ -413,7 +428,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 let key = self.read_value()?;
                 let val = self.read_value()?;
                 let dict = self.new_dict()?;
-                self.dict_set(&dict, &key, &val)?;
+                self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
                 dict
             }
             tag::PRIMITIVE_ARR => self.read_primitive_array()?,
@@ -467,6 +482,29 @@ impl<'a, 'py> Decoder<'a, 'py> {
         }
     }
 
+    /// `dict[key] = val` for a key that came out of the byte stream.
+    ///
+    /// A corrupted stream can put a container where a map key belongs, and
+    /// CPython then raises `TypeError: unhashable type`. Letting that escape
+    /// would break the documented contract that malformed javabin raises
+    /// `ValueError`, so translate it. Only this error path differs from
+    /// [`Self::dict_set`]; a hashable key costs the same single call.
+    fn dict_set_map_key(&self, dict: &Obj, key: &Obj, val: &Obj, offset: usize) -> Result<()> {
+        let rc = unsafe { ffi::PyDict_SetItem(dict.as_ptr(), key.as_ptr(), val.as_ptr()) };
+        if rc == 0 {
+            return Ok(());
+        }
+        if unsafe { ffi::PyErr_ExceptionMatches(ffi::PyExc_TypeError) } != 0 {
+            unsafe { ffi::PyErr_Clear() };
+            return Err(DecodeError::TypeMismatch {
+                expected: "hashable map key",
+                found: "unhashable value",
+                offset,
+            });
+        }
+        Err(DecodeError::PyErr)
+    }
+
     /// `dict[key_cstr] = val` for a static ASCII key, via `PyDict_SetItemString`.
     #[inline]
     fn dict_set_str(&self, dict: &Obj, key: &std::ffi::CStr, val: &Obj) -> Result<()> {
@@ -508,7 +546,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         let sz = self.reader.read_size(tag_byte)?;
         let dict = self.new_dict()?;
         for _ in 0..sz {
-            let name = self.expect_str()?;
+            let name = self.expect_name()?;
             let val = self.read_value()?;
             self.dict_set(&dict, &name, &val)?;
         }
@@ -569,7 +607,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 Slot::End => break,
                 Slot::Value(key) | Slot::Child(key) => {
                     let val = self.read_value()?;
-                    self.dict_set(&dict, &key, &val)?;
+                    self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
                 }
             }
         }
@@ -775,14 +813,20 @@ impl<'a, 'py> Decoder<'a, 'py> {
         Ok(dict)
     }
 
-    fn expect_str(&mut self) -> Result<Obj> {
+    /// Read a `NamedList` entry name, which is a string or -- legally -- null.
+    ///
+    /// See `py_decoder::Decoder::expect_name`. A null name is returned as
+    /// `None`, which [`obj_as_str`] reports as "not a string", so the envelope
+    /// walkers below simply never match it against `response`/`docs`.
+    fn expect_name(&mut self) -> Result<Obj> {
         let offset = self.reader.pos;
         let v = self.read_value()?;
-        if unsafe { ffi::PyUnicode_Check(v.as_ptr()) } != 0 {
+        let is_str = unsafe { ffi::PyUnicode_Check(v.as_ptr()) } != 0;
+        if is_str || v.as_ptr() == unsafe { ffi::Py_None() } {
             Ok(v)
         } else {
             Err(DecodeError::TypeMismatch {
-                expected: "string",
+                expected: "string or null",
                 found: "non-string",
                 offset,
             })
@@ -830,7 +874,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         let sz = self.reader.read_size(tag_byte)?;
         let dict = self.new_dict()?;
         for _ in 0..sz {
-            let name = self.expect_str()?;
+            let name = self.expect_name()?;
             let val = self.stream_envelope_value(&name, callback)?;
             self.dict_set(&dict, &name, &val)?;
         }
@@ -844,7 +888,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 Slot::End => break,
                 Slot::Value(key) | Slot::Child(key) => {
                     let val = self.stream_envelope_value(&key, callback)?;
-                    self.dict_set(&dict, &key, &val)?;
+                    self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
                 }
             }
         }
@@ -864,6 +908,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 _ => match t {
                     tag::SOLRDOCLST => return self.stream_solr_doc_list(callback),
                     tag::MAP_ENTRY_ITER => return self.stream_response_map_entry_iter(callback),
+                    tag::MAP => return self.stream_response_map(callback),
                     _ => {
                         self.reader.pos -= 1;
                     }
@@ -883,7 +928,7 @@ impl<'a, 'py> Decoder<'a, 'py> {
         let sz = self.reader.read_size(tag_byte)?;
         let dict = self.new_dict()?;
         for _ in 0..sz {
-            let name = self.expect_str()?;
+            let name = self.expect_name()?;
             let val = self.stream_docs_or_value(&name, callback)?;
             self.dict_set(&dict, &name, &val)?;
         }
@@ -899,9 +944,23 @@ impl<'a, 'py> Decoder<'a, 'py> {
                 Slot::End => break,
                 Slot::Value(key) | Slot::Child(key) => {
                     let val = self.stream_docs_or_value(&key, callback)?;
-                    self.dict_set(&dict, &key, &val)?;
+                    self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
                 }
             }
+        }
+        Ok(dict)
+    }
+
+    /// A `response` encoded as a plain `MAP` (a fixed number of entries rather
+    /// than `END`-terminated): what `/export` answers with when the request
+    /// failed, carrying the `EXCEPTION` document under `docs`.
+    fn stream_response_map(&mut self, callback: *mut ffi::PyObject) -> Result<Obj> {
+        let sz = self.reader.read_vint()? as usize;
+        let dict = self.new_dict()?;
+        for _ in 0..sz {
+            let key = self.read_value()?;
+            let val = self.stream_docs_or_value(&key, callback)?;
+            self.dict_set_map_key(&dict, &key, &val, self.reader.pos)?;
         }
         Ok(dict)
     }

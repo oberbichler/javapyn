@@ -76,11 +76,13 @@ def _flat_pairs_to_dict(flat: list) -> dict | None:
     Solr's JSON writer renders some NamedLists as a flat array rather than an
     object -- facet field counts, facet range counts, stats percentiles. The
     javabin encoding is a NamedList either way, which this decoder maps to a
-    dict, so the flat form has to be rebuilt before comparing.
+    dict, so the flat form has to be rebuilt before comparing. A ``None`` key is
+    expected: that is the ``facet.missing`` bucket.
     """
-    if len(flat) % 2 or not all(isinstance(k, str) for k in flat[::2]):
+    keys = flat[::2]
+    if len(flat) % 2 or not all(k is None or isinstance(k, str) for k in keys):
         return None
-    return dict(zip(flat[::2], flat[1::2]))
+    return dict(zip(keys, flat[1::2]))
 
 
 def _scalars_match(got: Any, ref: Any) -> bool:
@@ -162,6 +164,46 @@ def assert_matches_json(
     assert not problems, (
         f"{label or 'response'} differs from its wt=json reference "
         f"({len(problems)} difference(s)):\n  " + "\n  ".join(problems[:15])
+    )
+
+
+def _json_equivalent(obj: Any, via_json: Any) -> bool:
+    """Whether ``deserialize`` and ``deserialize_json`` agree on one value.
+
+    JSON cannot express three things javabin can, so the JSON path renders them
+    the way Solr's own JSON writer does. Everything else must be identical:
+
+    - ``bytes`` (BYTEARR) becomes a base64 string,
+    - a non-finite float becomes ``"Infinity"``/``"-Infinity"``/``"NaN"``,
+    - a null NamedList name becomes the ``""`` key.
+    """
+    if isinstance(obj, bytes):
+        return via_json == base64.b64encode(obj).decode()
+    if isinstance(obj, float) and not math.isfinite(obj):
+        if math.isnan(obj):
+            return via_json == "NaN"
+        return via_json == ("Infinity" if obj > 0 else "-Infinity")
+    if isinstance(obj, dict):
+        if not isinstance(via_json, dict):
+            return False
+        renamed = {("" if k is None else k): v for k, v in obj.items()}
+        if set(renamed) != set(via_json):
+            return False
+        return all(_json_equivalent(v, via_json[k]) for k, v in renamed.items())
+    if isinstance(obj, list):
+        return (
+            isinstance(via_json, list)
+            and len(obj) == len(via_json)
+            and all(_json_equivalent(a, b) for a, b in zip(obj, via_json))
+        )
+    return type(obj) is type(via_json) and obj == via_json
+
+
+def assert_json_path_matches(obj: Any, via_json: Any, label: str = "") -> None:
+    """Assert ``deserialize_json`` agrees with ``deserialize`` on the same bytes,
+    modulo the three renderings JSON forces (see :func:`_json_equivalent`)."""
+    assert _json_equivalent(obj, via_json), (
+        f"{label or 'response'}: deserialize_json disagrees with deserialize"
     )
 
 

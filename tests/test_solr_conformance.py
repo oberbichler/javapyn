@@ -8,9 +8,10 @@ of the search components (facets, stats, grouping, highlighting, debug, terms,
 cursors, collapse), error responses, and robustness against truncated and
 corrupted real bytes.
 
-Three tests are ``xfail(strict=True)``: they document defects found by exactly
-this suite, and will fail loudly (XPASS) once those defects are fixed, which is
-the signal to delete the marker.
+Several tests are regression tests for defects this suite found: the rejected
+null NamedList name (``test_facet_missing_bucket_decodes``), the silently
+skipped ``/export`` error (``test_export_error_is_visible_to_streaming_decoders``)
+and the lost infinities (``test_deserialize_json_keeps_non_finite_doubles``).
 
 Requires Docker; deselected by default. Run with ``pytest -m solr``.
 """
@@ -20,7 +21,12 @@ import math
 import random
 
 import pytest
-from javabin_compare import assert_matches_json, floats_match, solr_date_to_millis
+from javabin_compare import (
+    assert_json_path_matches,
+    assert_matches_json,
+    floats_match,
+    solr_date_to_millis,
+)
 from javabin_scanner import ALL_TAGS, ScanError, scan
 from solr_probe import (
     DOC_COUNT,
@@ -237,6 +243,14 @@ COMPONENTS: dict[str, dict[str, object]] = {
     "facet_field": {
         "facet": "true",
         "facet.field": "t_string",
+        "facet.limit": "-1",
+        "rows": "0",
+    },
+    # The bucket for documents missing the field has a *null* NamedList name.
+    "facet_missing": {
+        "facet": "true",
+        "facet.field": "t_string",
+        "facet.missing": "true",
         "facet.limit": "-1",
         "rows": "0",
     },
@@ -586,15 +600,15 @@ def test_every_truncation_of_a_real_response_raises_value_error(
 
 
 def test_corrupted_real_responses_never_crash(corpus: dict[str, bytes]) -> None:
-    """Random byte mutations of real responses must never crash the interpreter
-    or raise an undocumented exception type.
+    """Random byte mutations of real responses must raise ``ValueError`` or
+    decode cleanly -- nothing else.
 
-    ``TypeError`` is tolerated here because a corrupted stream can turn a map key
-    into a container, which the decoder then tries to use as a dict key; see the
-    xfail-ed ``test_unhashable_map_key_raises_value_error`` in
-    ``test_decoder.py``. Everything except ValueError/TypeError -- a Rust panic
-    surfacing as ``pyo3_runtime.PanicException``, say -- is a failure, and a
-    segfault would take the test session down with it.
+    The documented contract is that malformed javabin raises ``ValueError``, so
+    any other exception type is a failure: a Rust panic surfacing as
+    ``pyo3_runtime.PanicException``, or the ``TypeError`` that used to escape when
+    a mutation turned a map key into a container (see
+    ``test_decoder.py::test_unhashable_map_key_raises_value_error``). A segfault
+    would take the whole test session down with it.
     """
     rng = random.Random(20240817)
     mutations = 0
@@ -615,7 +629,7 @@ def test_corrupted_real_responses_never_crash(corpus: dict[str, bytes]) -> None:
             ):
                 try:
                     call()
-                except (ValueError, TypeError, RecursionError, MemoryError):
+                except (ValueError, RecursionError, MemoryError):
                     pass
                 except Exception as exc:  # noqa: BLE001 - the point of the test
                     pytest.fail(
@@ -627,11 +641,13 @@ def test_corrupted_real_responses_never_crash(corpus: dict[str, bytes]) -> None:
 
 def test_decoders_agree_on_every_real_response(corpus: dict[str, bytes]) -> None:
     """deserialize, deserialize_json, deserialize_stream and StreamDecoder must
-    agree on every real response that carries documents."""
+    agree on every real response."""
     for name, data in corpus.items():
         obj = javabin.deserialize(data)
         # Decoding is deterministic (NaN never compares equal to itself).
         assert _has_nan(obj) or javabin.deserialize(data) == obj, name
+
+        assert_json_path_matches(obj, json.loads(javabin.deserialize_json(data)), name)
 
         docs = _docs_of(obj)
         if docs is None:
@@ -674,19 +690,13 @@ def _has_nan(obj: object) -> bool:
 # -- defects this suite found -------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="NamedList entries with a null name are rejected; Solr emits one for "
-    "the facet.missing bucket (JavaBinCodec casts the name with (String), so "
-    "null is legal on the wire)",
-)
 def test_facet_missing_bucket_decodes(solr: SolrProbe) -> None:
     """``facet.missing=true`` adds a bucket whose NamedList *name* is null.
 
-    Solr's own reader tolerates it; javapyn raises
-    ``ValueError: expected string ... found non-string``, so an ordinary faceted
-    query is undecodable. Reproduces on Solr 8.11, 9.10 and 10.0, for string and
-    numeric fields, with both facet methods.
+    Solr writes the name as a NULL tag and its own reader tolerates it, so the
+    bucket lands under the ``None`` key. Regression test for a defect that made
+    any faceted query with ``facet.missing`` undecodable on Solr 8.11, 9.10 and
+    10.0, for string and numeric fields, with both facet methods.
     """
     data, ref = solr.request(
         "select",
@@ -709,20 +719,15 @@ def test_facet_missing_bucket_decodes(solr: SolrProbe) -> None:
     assert counts[None] == ref_counts[-1]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a failed /export decodes to an EXCEPTION document via deserialize, "
-    "but the streaming decoders report zero documents and no error",
-)
 def test_export_error_is_visible_to_streaming_decoders(solr: SolrProbe) -> None:
     """A failed ``/export`` must not look like an empty one.
 
     Without a sort parameter Solr answers HTTP 400 with
-    ``response.docs[0].EXCEPTION``, encoded as a MAP holding a plain ARR instead
-    of the MAP_ENTRY_ITER + ITERATOR shape of a successful export. ``deserialize``
-    surfaces the exception; ``deserialize_stream`` and ``StreamDecoder`` yield no
-    documents and raise nothing, so a caller that does not check the HTTP status
-    cannot tell a failed export from an empty result.
+    ``response.docs[0].EXCEPTION``, encoding ``response`` as a plain MAP holding
+    an ARR instead of the MAP_ENTRY_ITER + ITERATOR shape of a successful export.
+    Regression test for a defect where every streaming path skipped that shape,
+    so a caller that did not check the HTTP status could not tell a failed export
+    from an empty result.
     """
     data = solr.raw(
         "export",
@@ -735,23 +740,26 @@ def test_export_error_is_visible_to_streaming_decoders(solr: SolrProbe) -> None:
     assert "EXCEPTION" in full["response"]["docs"][0]
 
     streamed: list = []
-    javabin.deserialize_stream(data, streamed.append)
+    envelope = javabin.deserialize_stream(data, streamed.append)
     assert streamed == full["response"]["docs"]
+    assert envelope["response"]["docs"] == []
+
+    collected: list = []
+    decoder = javabin.StreamDecoder()
+    decoder.feed(data, collected.append)
+    decoder.finish()
+    assert collected == full["response"]["docs"]
+    assert decoder.count == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="deserialize_json turns non-finite doubles into null (serde_json has "
-    "no Infinity/NaN); deserialize returns inf and Solr's own wt=json writes "
-    'the string "Infinity"',
-)
 def test_deserialize_json_keeps_non_finite_doubles(solr: SolrProbe) -> None:
-    """``deserialize_json`` silently loses infinities.
+    """``deserialize_json`` must not lose infinities.
 
     Reachable from ordinary queries: summing the double extremes overflows in the
-    stats component, and a function query over them does too. ``deserialize``
-    reports ``inf`` faithfully, so the two entry points disagree even though the
-    docstring promises the same shape.
+    stats component, and a function query over them does too. Regression test for
+    a defect where serde_json rendered them as ``null``, so the JSON path
+    disagreed with ``deserialize`` despite promising the same shape. Both now
+    agree with Solr, which writes the string ``"Infinity"``.
     """
     data, ref = solr.request(
         "select",
@@ -764,7 +772,7 @@ def test_deserialize_json_keeps_non_finite_doubles(solr: SolrProbe) -> None:
     assert ref["stats"]["stats_fields"]["t_double"]["sumOfSquares"] == "Infinity"
 
     via_json = json.loads(javabin.deserialize_json(data))
-    assert math.isinf(via_json["stats"]["stats_fields"]["t_double"]["sumOfSquares"])
+    assert via_json["stats"]["stats_fields"]["t_double"]["sumOfSquares"] == "Infinity"
 
 
 # -- scale --------------------------------------------------------------------

@@ -414,8 +414,8 @@ impl ArrowDecoder {
             5 | 6 => {
                 let sz = r.read_size(t)?;
                 for _ in 0..sz {
-                    let name = self.read_field_name(r)?;
-                    if let Some(p) = self.envelope_value(r, &name)? {
+                    let name = self.read_envelope_name(r)?;
+                    if let Some(p) = self.envelope_value(r, name.as_deref())? {
                         return Ok(p);
                     }
                 }
@@ -424,8 +424,8 @@ impl ArrowDecoder {
                 if self.peek_end(r)? {
                     break;
                 }
-                let name = self.read_field_name(r)?;
-                if let Some(p) = self.envelope_value(r, &name)? {
+                let name = self.read_envelope_name(r)?;
+                if let Some(p) = self.envelope_value(r, name.as_deref())? {
                     return Ok(p);
                 }
             },
@@ -434,16 +434,16 @@ impl ArrowDecoder {
         Ok(DocsSeq::None)
     }
 
-    fn envelope_value(&mut self, r: &mut Reader<'_>, key: &str) -> Result<Option<DocsSeq>> {
-        if key == "response" || key == "result-set" {
+    fn envelope_value(&mut self, r: &mut Reader<'_>, key: Option<&str>) -> Result<Option<DocsSeq>> {
+        if key == Some("response") || key == Some("result-set") {
             let t = r.read_u8()?;
             let hi = t >> 5;
             match hi {
                 5 | 6 => {
                     let sz = r.read_size(t)?;
                     for _ in 0..sz {
-                        let name = self.read_field_name(r)?;
-                        if let Some(p) = self.docs_entry(r, &name)? {
+                        let name = self.read_envelope_name(r)?;
+                        if let Some(p) = self.docs_entry(r, name.as_deref())? {
                             return Ok(Some(p));
                         }
                     }
@@ -462,8 +462,20 @@ impl ArrowDecoder {
                         if self.peek_end(r)? {
                             break;
                         }
-                        let name = self.read_field_name(r)?;
-                        if let Some(p) = self.docs_entry(r, &name)? {
+                        let name = self.read_envelope_name(r)?;
+                        if let Some(p) = self.docs_entry(r, name.as_deref())? {
+                            return Ok(Some(p));
+                        }
+                    }
+                    return Ok(Some(DocsSeq::None));
+                }
+                // A plain MAP: the shape /export answers with when the request
+                // failed, holding `docs` as an ARR with one EXCEPTION document.
+                _ if t == tag::MAP => {
+                    let sz = r.read_vint()? as usize;
+                    for _ in 0..sz {
+                        let name = self.read_envelope_name(r)?;
+                        if let Some(p) = self.docs_entry(r, name.as_deref())? {
                             return Ok(Some(p));
                         }
                     }
@@ -480,8 +492,8 @@ impl ArrowDecoder {
         Ok(None)
     }
 
-    fn docs_entry(&mut self, r: &mut Reader<'_>, name: &str) -> Result<Option<DocsSeq>> {
-        if name == "docs" {
+    fn docs_entry(&mut self, r: &mut Reader<'_>, name: Option<&str>) -> Result<Option<DocsSeq>> {
+        if name == Some("docs") {
             let t = r.read_u8()?;
             if t >> 5 == 4 {
                 return Ok(Some(DocsSeq::Arr(r.read_size(t)?)));
@@ -634,29 +646,35 @@ impl ArrowDecoder {
         }
     }
 
-    /// Read a field name (STR/EXTERN_STRING) as an owned string, used for
-    /// envelope keys.
-    fn read_field_name(&mut self, r: &mut Reader<'_>) -> Result<String> {
+    /// Read an envelope entry name (STR/EXTERN_STRING) as an owned string.
+    ///
+    /// A `NamedList` name may legally be the `NULL` tag (Solr writes one for the
+    /// `facet.missing` bucket), which yields `None`. Since the envelope walk only
+    /// compares names against `response`/`result-set`/`docs`, an unnamed entry
+    /// simply never matches.
+    fn read_envelope_name(&mut self, r: &mut Reader<'_>) -> Result<Option<String>> {
         let t = r.read_u8()?;
         let hi = t >> 5;
         match hi {
-            1 => Ok(r.read_str_tagged(t)?.to_string()),
+            1 => Ok(Some(r.read_str_tagged(t)?.to_string())),
             7 => {
                 let idx = r.read_size(t)?;
                 if idx != 0 {
                     self.extern_strings
                         .get(idx - 1)
                         .cloned()
+                        .map(Some)
                         .ok_or(DecodeError::UnexpectedEof { offset: r.pos })
                 } else {
                     let inner = r.read_u8()?;
                     let s = r.read_str_tagged(inner)?.to_string();
                     self.extern_strings.push(s.clone());
-                    Ok(s)
+                    Ok(Some(s))
                 }
             }
+            _ if t == tag::NULL => Ok(None),
             _ => Err(DecodeError::TypeMismatch {
-                expected: "field name (string)",
+                expected: "field name (string or null)",
                 found: "other tag",
                 offset: r.pos - 1,
             }),
@@ -1298,6 +1316,26 @@ mod tests {
         b
     }
 
+    /// Build a failed-`/export` message: MAP_ENTRY_ITER{"response": MAP size=2
+    /// {"docs": ARR[docs], "numFound": 0}} END. Solr answers with this shape
+    /// when the export request itself is rejected, the error being the one
+    /// document.
+    fn map_response_msg(docs: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = vec![V, tag::MAP_ENTRY_ITER];
+        str_field(&mut b, "response");
+        b.push(tag::MAP);
+        b.push(2); // vint size, not NAMED_LST's 5-bit inline size
+        str_field(&mut b, "docs");
+        b.push(tag::ARR | docs.len() as u8);
+        for d in docs {
+            b.extend_from_slice(d);
+        }
+        str_field(&mut b, "numFound");
+        b.push(tag::SLONG);
+        b.push(tag::END);
+        b
+    }
+
     /// Encode one SOLRDOC from (field-name, encoded-value) pairs.
     fn doc(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut b = vec![tag::SOLRDOC, tag::ORDERED_MAP | fields.len() as u8];
@@ -1427,6 +1465,28 @@ mod tests {
                 .unwrap()
                 .value(0),
             1_517_270_400_000
+        );
+    }
+
+    #[test]
+    fn map_shaped_response_yields_its_documents() {
+        // A failed /export encodes `response` as a plain MAP holding an ARR of
+        // documents. Skipping that shape made deserialize_arrow return zero rows
+        // for it, indistinguishable from an empty export.
+        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let docs = vec![doc(&[("s", v_str("No sort criteria was provided."))])];
+
+        let batch = decode_test(schema, &map_response_msg(&docs));
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "No sort criteria was provided."
         );
     }
 

@@ -28,7 +28,12 @@ pub enum Value {
     Map(Vec<(Value, Value)>),
     /// A javabin `NAMED_LST` / `ORDERED_MAP` / `SIMPLE_MAP` (string-keyed,
     /// order-preserving, keys may repeat).
-    NamedList(Vec<(String, Value)>),
+    ///
+    /// An entry name is `None` when it was written as the `NULL` tag. That is
+    /// legal on the wire -- `JavaBinCodec.readNamedList` reads the name with
+    /// `(String) readVal(dis)`, which yields null -- and Solr does it in
+    /// practice for the `facet.missing` bucket of a field facet.
+    NamedList(Vec<(Option<String>, Value)>),
     /// A javabin `SOLRDOC`. Child documents (added via Solr's nested/child
     /// document feature) are kept separate from regular fields, mirroring
     /// `SolrDocument.getChildDocuments()`.
@@ -73,7 +78,7 @@ impl Value {
             Value::Double(v) => json_from_f64(*v),
             Value::Date(v) => J::from(*v),
             Value::Str(s) => J::String(s.clone()),
-            Value::Bytes(b) => J::Array(b.iter().map(|byte| J::from(*byte)).collect()),
+            Value::Bytes(b) => J::String(base64_encode(b)),
             Value::List(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Map(entries) => {
                 // JSON objects require string keys; fall back to an array of
@@ -100,7 +105,9 @@ impl Value {
             Value::NamedList(entries) => {
                 let mut map = serde_json::Map::new();
                 for (k, v) in entries {
-                    map.insert(k.clone(), v.to_json());
+                    // JSON has no null keys. Solr's own JSON writer renders a
+                    // null map key as the empty string, so match that.
+                    map.insert(k.clone().unwrap_or_default(), v.to_json());
                 }
                 J::Object(map)
             }
@@ -145,10 +152,117 @@ impl Value {
     }
 }
 
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 (RFC 4648, with padding), as Solr's JSON writer emits a
+/// binary field.
+///
+/// Hand-rolled rather than pulled in as a dependency: it is a dozen lines, this
+/// crate ships as a wheel and keeps its dependency list deliberately short, and
+/// the live conformance tests check the output against Solr's own base64.
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        // Pad the group to 24 bits, then take four 6-bit indices; the trailing
+        // ones are replaced by '=' for a short final group.
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let bits = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                let index = (bits >> (18 - 6 * i)) & 0x3F;
+                out.push(BASE64_ALPHABET[index as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Convert a decoded float to JSON.
+///
+/// JSON has no literal for the non-finite values, so a `DOUBLE`/`FLOAT` tag
+/// carrying one has to be rendered some other way. Solr's own JSON writer emits
+/// the strings `"Infinity"`, `"-Infinity"` and `"NaN"`, so match that: it keeps
+/// `deserialize_json` a drop-in for `wt=json`, and it is not lossy the way
+/// serde_json's default (null) would be. These reach ordinary responses through
+/// the stats component over large doubles and through overflowing function
+/// queries.
 fn json_from_f64(v: f64) -> serde_json::Value {
-    serde_json::Number::from_f64(v)
-        .map(serde_json::Value::Number)
-        .unwrap_or(serde_json::Value::Null)
+    match serde_json::Number::from_f64(v) {
+        Some(n) => serde_json::Value::Number(n),
+        None if v.is_nan() => serde_json::Value::String("NaN".into()),
+        None if v > 0.0 => serde_json::Value::String("Infinity".into()),
+        None => serde_json::Value::String("-Infinity".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_finite_floats_become_solr_style_strings() {
+        // JSON has no literal for these; Solr's own writer emits strings, and
+        // serde_json's default of null would silently lose the value.
+        let cases = [
+            (f64::INFINITY, r#""Infinity""#),
+            (f64::NEG_INFINITY, r#""-Infinity""#),
+            (f64::NAN, r#""NaN""#),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(Value::Double(input).to_json().to_string(), expected);
+        }
+        assert_eq!(
+            Value::Float(f32::INFINITY).to_json().to_string(),
+            r#""Infinity""#
+        );
+    }
+
+    #[test]
+    fn base64_matches_rfc_4648_vectors() {
+        let cases = [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "{input:?}");
+        }
+        // Every byte value, so the full alphabet and both pad lengths are hit.
+        let all: Vec<u8> = (0..=255).collect();
+        let encoded = base64_encode(&all);
+        assert_eq!(encoded.len(), 344);
+        assert!(encoded.starts_with("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIj"));
+        assert!(encoded.ends_with("+fr7/P3+/w=="));
+    }
+
+    #[test]
+    fn bytes_become_a_base64_string() {
+        assert_eq!(
+            Value::Bytes(vec![0, 1, 2, 255]).to_json().to_string(),
+            r#""AAEC/w==""#
+        );
+    }
+
+    #[test]
+    fn finite_floats_stay_numbers() {
+        assert_eq!(Value::Double(1.5).to_json().to_string(), "1.5");
+        assert_eq!(Value::Double(-0.0).to_json().to_string(), "-0.0");
+        assert_eq!(
+            Value::Double(f64::MAX).to_json(),
+            serde_json::json!(f64::MAX)
+        );
+    }
 }
 
 /// Count the total number of nodes in a `Value` tree (for benchmarking).

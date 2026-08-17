@@ -19,7 +19,7 @@ Requires Docker; deselected by default. Run with ``pytest -m solr``.
 import json
 
 import pytest
-from javabin_compare import assert_docs_match
+from javabin_compare import assert_docs_match, assert_json_path_matches
 from solr_probe import COLLECTION, DOC_COUNT, EXPORT_FIELDS, SolrProbe
 
 import javapyn as javabin
@@ -109,7 +109,9 @@ def test_deserialize_json_matches_deserialize(solr: SolrProbe, handler: str) -> 
     else:
         data, _ = solr.stream(STREAM_EXPR)
 
-    assert json.loads(javabin.deserialize_json(data)) == javabin.deserialize(data)
+    assert_json_path_matches(
+        javabin.deserialize(data), json.loads(javabin.deserialize_json(data)), handler
+    )
 
 
 def test_deserialize_stream_matches_full_decode(solr: SolrProbe) -> None:

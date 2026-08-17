@@ -266,6 +266,21 @@ def _type_documents() -> list[dict[str, Any]]:
     ]
 
 
+def count_documents(docs: list[dict[str, Any]]) -> int:
+    """Total documents an update request creates, nesting included.
+
+    Solr indexes a child document as a document in its own right, so the parent
+    of two children with one grandchild accounts for four.
+    """
+    total = 0
+    for doc in docs:
+        total += 1
+        for value in doc.values():
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                total += count_documents(value)
+    return total
+
+
 class SolrProbe:
     """Thin client against the two provisioned collections."""
 
@@ -306,6 +321,7 @@ class SolrProbe:
             self._create_collection(coll)
             self._create_schema(coll, fields)
             self._index(coll, docs)
+            self._wait_for_documents(coll, count_documents(docs))
 
     def _create_collection(self, coll: str) -> None:
         response = self.client.get(
@@ -345,6 +361,32 @@ class SolrProbe:
             f"{self.base_url}/{coll}/update", params={"commit": "true"}
         )
         response.raise_for_status()
+
+    def _wait_for_documents(
+        self, coll: str, expected: int, attempts: int = 60, delay: float = 0.5
+    ) -> None:
+        """Poll until every indexed document is searchable.
+
+        A synchronous ``commit=true`` is not quite the end of the story: on Solr 8
+        the first queries after provisioning intermittently saw an empty
+        collection, so waiting for the process to be up is not enough -- the data
+        has to be visible too, or the earliest tests fail for reasons that have
+        nothing to do with the decoder.
+        """
+        last = -1
+        for _ in range(attempts):
+            response = self.client.get(
+                f"{self.base_url}/{coll}/select",
+                params={"q": "*:*", "rows": "0", "wt": "json"},
+            )
+            if response.status_code == 200:
+                last = response.json()["response"]["numFound"]
+                if last >= expected:
+                    return
+            time.sleep(delay)
+        raise RuntimeError(
+            f"{coll}: only {last} of {expected} documents became searchable"
+        )
 
     # -- dual-format fetches --------------------------------------------
 
