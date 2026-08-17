@@ -118,6 +118,25 @@ class Scanner:
             raise ScanError(f"payload of {count} bytes overruns the data at {self.pos}")
         self.pos += count
 
+    def _document_fields(self) -> None:
+        """Walk a document's field list.
+
+        An entry is a (name, value) pair -- except for an *anonymous* child
+        document, which is a single value where a name would be. Reading two
+        values unconditionally would mis-frame the rest of the document, so peek.
+        """
+        tag = self._byte()
+        shifted = tag >> 5
+        if shifted not in (5, 6):
+            raise ScanError(f"document field list has tag {tag:#04x} at {self.pos - 1}")
+        self.tags[SHIFTED_TAGS[shifted]] += 1
+        for _ in range(self._size(tag)):
+            if self.data[self.pos : self.pos + 1] == b"\x0b":  # SOLRDOC: a child
+                self._value()
+            else:
+                self._value()  # field name
+                self._value()  # field value
+
     def _value(self) -> object:
         """Walk one value; returns the END sentinel for an END tag."""
         tag = self._byte()
@@ -160,7 +179,7 @@ class Scanner:
                     self._value()
                     self._value()
             elif name in ("SOLRDOC", "SOLRINPUTDOC"):
-                self._value()  # the field ORDERED_MAP
+                self._document_fields()
             elif name == "SOLRDOCLST":
                 self._value()  # [numFound, start, maxScore, numFoundExact]
                 self._value()  # the documents

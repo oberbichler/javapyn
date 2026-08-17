@@ -340,6 +340,95 @@ def test_child_documents_explode_into_arrow_rows(solr: SolrProbe) -> None:
     assert pa.Table.from_batches(batches, schema=schema).to_pydict() == exploded
 
 
+def test_anonymous_child_documents(solr: SolrProbe) -> None:
+    """The ``_childDocuments_`` shape, from a real Solr, through every entry point.
+
+    A schema without ``_nest_path_`` -- an older, hand-written one -- makes the
+    ``[child]`` transformer return children with no field name of their own: a
+    ``SOLRDOC`` sitting where a field name would be. Systems on such a schema see
+    only this shape, so it is worth pinning against real bytes rather than only
+    against the reference encoder.
+    """
+    data, ref = solr.legacy_children()
+
+    result = javabin.deserialize(data)
+    assert_matches_json(result, ref, "anonymous child documents")
+
+    parents = result["response"]["docs"]
+    assert [doc["id"] for doc in parents] == ["legacy_parent", "legacy_parent_2"]
+    assert [child["id"] for child in parents[0]["_childDocuments_"]] == [
+        "legacy_child_1",
+        "legacy_child_2",
+    ]
+    assert [child["id"] for child in parents[1]["_childDocuments_"]] == [
+        "legacy_child_3"
+    ]
+
+    # The JSON path keeps the key, and both streaming decoders emit one callback
+    # per *parent*, children nested inside -- even fed three bytes at a time.
+    assert json.loads(javabin.deserialize_json(data)) == result
+    streamed: list = []
+    javabin.deserialize_stream(data, streamed.append)
+    assert streamed == parents
+
+    collected: list = []
+    decoder = javabin.StreamDecoder()
+    for i in range(0, len(data), 3):
+        decoder.feed(data[i : i + 3], collected.append)
+    decoder.finish()
+    assert collected == parents
+    assert decoder.count == 2
+
+
+def test_anonymous_child_documents_in_arrow(solr: SolrProbe) -> None:
+    """Anonymous children explode into rows like named ones, minus the name.
+
+    ``children="skip"`` refuses them instead of dropping them silently: unlike a
+    named child field, there is no field name to leave out of the schema, so
+    skipping would lose data with nothing in the schema hinting at it.
+    """
+    pa = pytest.importorskip("pyarrow")
+
+    data, _ = solr.legacy_children()
+    schema = pa.schema(
+        [
+            ("id", pa.string()),
+            ("title", pa.string()),
+            ("_parent_id", pa.string()),
+            ("_depth", pa.int32()),
+            ("_child_field", pa.string()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="_childDocuments_"):
+        javabin.deserialize_arrow(data, schema)
+
+    exploded = javabin.deserialize_arrow(data, schema, children="explode").to_pydict()
+
+    assert exploded["id"] == [
+        "legacy_parent",
+        "legacy_child_1",
+        "legacy_child_2",
+        "legacy_parent_2",
+        "legacy_child_3",
+    ]
+    assert exploded["_parent_id"] == [
+        None,
+        "legacy_parent",
+        "legacy_parent",
+        None,
+        "legacy_parent_2",
+    ]
+    assert exploded["_depth"] == [0, 1, 1, 0, 1]
+    # Anonymous: there is no field name to report for any of them.
+    assert exploded["_child_field"] == [None] * 5
+
+    decoder = javabin.ArrowStreamDecoder(schema, batch_size=2, children="explode")
+    batches = [b for i in range(0, len(data), 3) for b in decoder.feed(data[i : i + 3])]
+    batches.extend(decoder.finish())
+    assert pa.Table.from_batches(batches, schema=schema).to_pydict() == exploded
+
+
 def test_explode_is_a_no_op_for_flat_responses(solr: SolrProbe) -> None:
     """``/export`` already returns children as documents of their own, so the
     mode changes nothing there -- the row count stays the document count."""
@@ -586,6 +675,7 @@ def collect_corpus(solr: SolrProbe) -> dict[str, bytes]:
         {"q": "id:parent", "fl": "*,[child]", "wt": "javabin"},
         coll=TYPES_COLLECTION,
     )
+    corpus["select_anonymous_children"] = solr.legacy_children()[0]
     corpus["export_types"] = solr.export(coll=TYPES_COLLECTION)[0]
     corpus["export_movies"] = solr.export()[0]
     corpus["export_empty"] = solr.export(q="movie_id:nope")[0]

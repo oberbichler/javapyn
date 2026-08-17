@@ -15,6 +15,11 @@ Two collections are provisioned, for two different jobs:
     A small corpus that puts every javabin scalar tag and every awkward value
     (numeric extremes, denormals, non-BMP text, empty and huge strings, binary
     blobs, absent fields, nested child documents) into a real Solr.
+``solr_legacy_nested``
+    Parents with *anonymous* child documents -- the ``_childDocuments_`` shape a
+    schema without ``_nest_path_`` produces. Solr will not emit it from the
+    ``_default`` configset as shipped, so this collection deliberately drops that
+    field to reproduce what an older, hand-written schema does.
 
 Deliberately free of pytest imports so it stays a plain, reusable client;
 the container lifecycle lives in ``conftest.py``.
@@ -32,6 +37,7 @@ import httpx
 
 COLLECTION = "solr_movies"
 TYPES_COLLECTION = "solr_types"
+LEGACY_COLLECTION = "solr_legacy_nested"
 
 #: Enough documents that an ``/export`` response spans more than one network
 #: chunk (~210 KB), so ``StreamDecoder`` has to resume across a real HTTP chunk
@@ -99,6 +105,16 @@ TYPE_EXPORT_FIELDS = ",".join(
     ]
 )
 
+#: The legacy-nesting corpus: two fields, and children attached with no field
+#: name of their own.
+LEGACY_FIELDS: tuple[dict[str, Any], ...] = (
+    {"name": "title", "type": "string"},
+    {"name": "kind", "type": "string"},
+)
+
+#: Documents in solr_legacy_nested, children included.
+LEGACY_DOC_COUNT = 5
+
 INT_MAX, INT_MIN = 2**31 - 1, -(2**31)
 LONG_MAX, LONG_MIN = 2**63 - 1, -(2**63)
 FLOAT_MAX = 3.4028234663852886e38
@@ -122,6 +138,32 @@ def _bulk_documents() -> list[dict[str, Any]]:
             "last_updated": f"2024-01-{(i % 28) + 1:02d}T12:34:56Z",
         }
         for i in range(DOC_COUNT)
+    ]
+
+
+def _legacy_documents() -> list[dict[str, Any]]:
+    """Parents whose children are attached under the reserved
+    ``_childDocuments_`` key, which is how they arrive back on the wire too:
+    a ``SOLRDOC`` sitting where a field name would be, with no name at all.
+    """
+    return [
+        {
+            "id": "legacy_parent",
+            "title": "Parent One",
+            "kind": "parent",
+            "_childDocuments_": [
+                {"id": "legacy_child_1", "title": "Anon A", "kind": "child"},
+                {"id": "legacy_child_2", "title": "Anon B", "kind": "child"},
+            ],
+        },
+        {
+            "id": "legacy_parent_2",
+            "title": "Parent Two",
+            "kind": "parent",
+            "_childDocuments_": [
+                {"id": "legacy_child_3", "title": "Anon C", "kind": "child"},
+            ],
+        },
     ]
 
 
@@ -319,15 +361,35 @@ class SolrProbe:
         raise RuntimeError(f"Solr did not become ready at {self.base_url}: {last}")
 
     def provision(self) -> None:
-        """Create both collections, their schemas, and their corpora."""
+        """Create the collections, their schemas, and their corpora."""
         for coll, fields, docs in (
             (COLLECTION, SCHEMA_FIELDS, _bulk_documents()),
             (TYPES_COLLECTION, TYPE_FIELDS, _type_documents()),
+            (LEGACY_COLLECTION, LEGACY_FIELDS, _legacy_documents()),
         ):
             self._create_collection(coll)
             self._create_schema(coll, fields)
+            if coll == LEGACY_COLLECTION:
+                self._drop_nest_path(coll)
             self._index(coll, docs)
             self._wait_for_documents(coll, count_documents(docs))
+
+    def _drop_nest_path(self, coll: str) -> None:
+        """Remove ``_nest_path_`` so that child documents come back *anonymous*.
+
+        With that field present -- as the ``_default`` configset ships it -- Solr
+        records the field a child was indexed under and returns children by name.
+        Without it, the ``[child]`` transformer falls back to the older shape and
+        returns them under ``_childDocuments_``, which is what an older schema
+        does and what this collection exists to reproduce.
+        """
+        response = self.client.post(
+            f"{self.base_url}/{coll}/schema",
+            json={"delete-field": {"name": "_nest_path_"}},
+        )
+        # A configset that never defined the field is equally fine.
+        if response.status_code != 200 and "_nest_path_" not in response.text:
+            response.raise_for_status()
 
     def _create_collection(self, coll: str) -> None:
         response = self.client.get(
@@ -433,6 +495,14 @@ class SolrProbe:
         else:
             response = self.client.post(url, data=query)
         return response.content
+
+    def legacy_children(self) -> tuple[bytes, dict]:
+        """A ``/select`` returning parents with anonymous child documents."""
+        return self.request(
+            "select",
+            {"q": "kind:parent", "fl": "*,[child]", "sort": "id asc"},
+            coll=LEGACY_COLLECTION,
+        )
 
     def select(self, *, coll: str = COLLECTION, **params: str) -> tuple[bytes, dict]:
         """Run a ``/select`` query twice; return (javabin bytes, wt=json dict)."""
