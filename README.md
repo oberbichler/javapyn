@@ -25,7 +25,25 @@ data = javapyn.deserialize(response.content)
 json_text = javapyn.deserialize_json(response.content)
 ```
 
-`deserialize` returns native Python objects: dict, list, str, int, float, bool, bytes, None. SolrDocumentList values (the response key of a query result) are shaped like Solr's own `wt=json` response: `{"numFound", "start", "maxScore", "numFoundExact", "docs"}`. Child documents (Solr's nested/child-document feature) appear under a `"_childDocuments_"` key on the parent document.
+`deserialize` returns native Python objects: dict, list, str, int, float, bool, bytes, None. SolrDocumentList values (the response key of a query result) are shaped like Solr's own `wt=json` response: `{"numFound", "start", "maxScore", "numFoundExact", "docs"}`.
+
+### Child documents
+
+Solr returns nested documents in one of two shapes, and javapyn passes both through exactly as `wt=json` does:
+
+- **Named** — what you get from a modern Solr (a configset defining `_nest_path_`, including `_default`) with the `[child]` transformer: children sit under the field they were indexed on, nested arbitrarily deep.
+  ```python
+  docs = javapyn.deserialize(resp.content)["response"]["docs"]
+  docs[0]["chapters"][0]["title"]     # a child document, as a plain dict
+  ```
+- **Anonymous** — the older shape, from a schema without `_nest_path_`: children have no field name and appear under a `"_childDocuments_"` key on the parent.
+
+Two consequences worth planning for:
+
+- **Only `/select` nests.** `/export` and `/stream` have no `[child]` transformer, so Solr returns every child as a document of its own, interleaved with the parents; the `_root_` field is the only link back. Add it to `fl` if you need to regroup them.
+- **`deserialize_stream` and `StreamDecoder` emit one callback per *top-level* document**, with its children nested inside — not one callback per document in the index.
+
+`deserialize_arrow` and `ArrowStreamDecoder` produce a flat table, so a nesting field simply has no column: leave it out of the schema and it is skipped, parents becoming the rows. The anonymous shape is rejected instead, since it carries no field name to leave out.
 
 `deserialize_json` does the same decoding but serializes directly to a JSON string via `serde_json`, skipping the Python object construction step. Where JSON cannot express what javabin can, the output matches Solr's own `wt=json`: a binary field becomes a base64 string, a non-finite float becomes `"Infinity"`/`"-Infinity"`/`"NaN"`, and a null NamedList name becomes the empty-string key.
 
